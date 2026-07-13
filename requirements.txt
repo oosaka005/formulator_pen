@@ -1,0 +1,4 @@
+# Pi 5 host-side dependencies for the dispenser project.
+# The pinned core stack lives in pico-workspace/requirements.pi5.txt.
+-r pico-workspace/requirements.pi5.txt
+openpyxl==3.1.5
