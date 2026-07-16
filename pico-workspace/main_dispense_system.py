@@ -155,8 +155,8 @@ FLUID_PROFILES = {
     },
     "BLUESILV12": {
         "formulator_profile": "BLUESILV12",
-        "calibration_offset": 0.2051,
-        "calibration_slope": 0.7581,
+        "calibration_offset": 0.1569,
+        "calibration_slope": 0.9326,
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
@@ -204,12 +204,24 @@ RESULTS_XLSX = Path(__file__).parent / "dispense_results.xlsx"
 class DispenseJob:
     """Represents a single dispense job."""
 
-    def __init__(self, volume_ml=None, container_id=None, location=None, fluid_profile=None, operation_mode=None):
+    VALID_ACTIONS = ("FILL", "DISPENSE", "BOTH")
+
+    def __init__(self, volume_ml=None, container_id=None, location=None, fluid_profile=None, operation_mode=None, action=None, cycles=None):
         self.location = location
         self.volume_ml = volume_ml
         self.container_id = container_id or f"VIAL_{time.time()}"
         self.fluid_profile = fluid_profile or FORMULATOR_FLUID_PROFILE
         self.operation_mode = operation_mode or "NORMAL"  # NORMAL or PRIMING
+        if self.operation_mode == "NORMAL":
+            self.action = (action or "BOTH").strip().upper()
+            if self.action not in DispenseJob.VALID_ACTIONS:
+                raise ValueError(f"Unknown action '{action}'. Must be one of {DispenseJob.VALID_ACTIONS}")
+        else:
+            self.action = "N/A"
+        self.cycles = int(cycles) if cycles is not None else 1  # PRIMING mode only: number of IN/OUT purge cycles
+        if self.cycles < 1:
+            raise ValueError(f"cycles must be >= 1, got {self.cycles}")
+        self.dispense_status = "OK"  # OK or INSUFFICIENT_VOLUME (set when a DISPENSE/BOTH move is clamped)
         self.formulator_profile_token = None
         self.command_volume_ml = None
         self.target_percent = None
@@ -235,7 +247,7 @@ class DispenseJob:
 class IntegratedDispenser:
     """Queue-based dispenser orchestrating CNC, formulator, and balance.
     
-    Workflow for NORMAL mode (default):
+    Workflow for NORMAL mode (default action="BOTH"):
     1. Valve moves to UP position
     2. Draw fluid into formulator (IN)
     3. Valve moves to THRU position
@@ -246,11 +258,22 @@ class IntegratedDispenser:
     8. Remove fluid from tip post-dispense
     9. Read final weight from balance
     10. Record actuator position after dispense
-    
+
+    NORMAL mode also supports splitting fill and dispense into separate jobs via
+    enqueue(action=...):
+    - action="FILL": steps 1-2 only, then valve closes and holds the drawn fluid.
+    - action="DISPENSE": opens the valve and dispenses volume_ml from whatever is
+      currently held, computed as a %-delta move from the current actuator position
+      (same calibrated volume<->% line, applied as a relative move). If the requested
+      volume needs more travel than remains above the reference position, the move is
+      skipped entirely (actuator stays put) and the job is flagged INSUFFICIENT_VOLUME
+      instead of over- or under-dispensing.
+
     Workflow for PRIMING mode:
-    - 4 cycles of: Valve UP -> Move IN to target% -> Wait 7s -> Valve THRU -> Move OUT to target% -> Wait 7s
+    - N cycles (default 1, set via enqueue(cycles=...)) of: Valve UP -> Move IN to target%
+      -> Wait 7s -> Valve THRU -> Move OUT to target% -> Wait 7s
     - No volume calibration or balance reading
-    
+
     Each job can specify its own operation_mode (NORMAL or PRIMING) via enqueue(operation_mode=...).
     """
     
@@ -297,22 +320,55 @@ class IntegratedDispenser:
     def _to_firmware_target_percent(self, command_volume_ml):
         """Convert firmware command volume to actuator target percent used by Pico."""
         return (command_volume_ml + CALIBRATION_OFFSET) / CALIBRATION_SLOPE
-        
-    def enqueue(self, volume_ml=None, container_id=None, location=None, fluid_profile=None, operation_mode=None):
+
+    def _to_firmware_delta_percent(self, command_volume_ml):
+        """Convert a command volume delta to an actuator percent delta.
+
+        Same linear mapping as _to_firmware_target_percent, but for a relative
+        move from the current position rather than an absolute target — the
+        offset cancels out since it's a fixed additive constant on both sides.
+        """
+        return command_volume_ml / CALIBRATION_SLOPE
+
+    def _apply_profile_delta_correction(self, requested_volume_ml, profile_slope):
+        """Fluid correction for a partial (delta) dispense — deliberately no profile_offset term.
+
+        _apply_profile_volume_correction's profile_offset represents a one-time bonus
+        that only shows up on a full round trip back to home (e.g. relief/valve-seating
+        on arrival). A delta dispense stops mid-stroke and never reaches that event, so
+        subtracting profile_offset here would silently short every partial dispense by
+        about that amount.
+        """
+        if abs(profile_slope) < 1e-9:
+            raise ValueError("Profile calibration_slope cannot be 0")
+        return max(0.0, requested_volume_ml / profile_slope)
+
+    def enqueue(self, volume_ml=None, container_id=None, location=None, fluid_profile=None, operation_mode=None, action=None, cycles=None):
         """Add a dispense job to the queue.
-        
+
         Args:
             volume_ml: Volume to dispense in mL (required for NORMAL, ignored for PRIMING)
             container_id: Optional identifier for this job
             location: Optional CNC position name (reserved for future XY moves)
             fluid_profile: Optional profile override (e.g., WATER, GLYCERIN, BLUESIL)
             operation_mode: Optional mode ("NORMAL" or "PRIMING", default: "NORMAL")
+            action: Optional NORMAL-mode sub-action ("FILL", "DISPENSE", or "BOTH", default: "BOTH")
+                - BOTH: draw volume_ml in, then dispense it back out (original behavior)
+                - FILL: draw volume_ml in and hold (valve closes, nothing dispensed)
+                - DISPENSE: dispense volume_ml from whatever is currently held, computed as a
+                  calibrated %-delta move from the current actuator position (not an absolute
+                  volume command). If not enough travel remains above the reference position,
+                  the move is skipped entirely (actuator stays put) and the job is flagged
+                  INSUFFICIENT_VOLUME.
+            cycles: Optional PRIMING-mode number of IN/OUT purge cycles (default: 1). Ignored
+                for NORMAL mode.
         """
-        job = DispenseJob(volume_ml, container_id, location, fluid_profile=fluid_profile, operation_mode=operation_mode)
+        job = DispenseJob(volume_ml, container_id, location, fluid_profile=fluid_profile, operation_mode=operation_mode, action=action, cycles=cycles)
         self.queue.append(job)
         location_note = f" at {location}" if location else ""
         vol_str = f"{volume_ml} mL" if volume_ml is not None else "N/A (PRIMING)"
-        print(f"[QUEUE] Added: {job.container_id} ({vol_str}{location_note}, fluid={job.fluid_profile}, mode={job.operation_mode})")
+        mode_note = f"mode={job.operation_mode}, action={job.action}" if job.operation_mode == "NORMAL" else f"mode={job.operation_mode}, cycles={job.cycles}"
+        print(f"[QUEUE] Added: {job.container_id} ({vol_str}{location_note}, fluid={job.fluid_profile}, {mode_note})")
     
     async def process_queue(self):
         """Main queue processor - runs continuously."""
@@ -344,10 +400,300 @@ class IntegratedDispenser:
                 self.busy = False
             
             await asyncio.sleep(0.5)
-    
+
+    async def _do_fill(self, job, command_volume_ml, profile_token, pwm_in, pwm_out):
+        """Draw fluid into the formulator and leave the valve in the correct holding state.
+
+        For action="BOTH" the valve ends at THRU, ready for the immediate dispense that
+        follows in the same job. For action="FILL" the valve ends at CLOSED, sealing the
+        drawn fluid until a later DISPENSE job opens it.
+        """
+        end_valve = "THRU" if job.action == "BOTH" else "CLOSED"
+
+        # -------- STEP 1: Move valve to the correct position before drawing --------
+        # A fill normally moves UP in % (drawing fluid in through the intake path), so the
+        # valve goes to UP. But if the actuator is already sitting above this fill's target
+        # (e.g. left over from a prior job), the "IN" move actually has to travel DOWN to
+        # reach it — that's physically a dispense motion, not an intake, so the valve needs
+        # to be at THRU for it instead of UP.
+        current_pos = self.formulator.get_position()
+        if current_pos is not None and job.target_percent is not None and current_pos > job.target_percent:
+            draw_valve = "THRU"
+            print(
+                f"[DISPENSE] Step 1: Actuator ({current_pos:.2f}%) is above fill target "
+                f"({job.target_percent:.2f}%); moving valve to THRU instead of UP"
+            )
+        else:
+            draw_valve = "UP"
+            print("[DISPENSE] Step 1: Moving valve to UP position")
+        self.formulator.valve_move(draw_valve)
+        await asyncio.sleep(1)
+
+        # -------- STEP 2: Draw fluid (IN) --------
+        print(f"[DISPENSE] Step 2: Drawing {job.volume_ml} mL into formulator")
+        time_in_start = time.time()
+        ok_in = self.formulator.pump_volume(
+            command_volume_ml,
+            "IN",
+            pwm_percent=pwm_in,
+            viscosity_profile=profile_token,
+        )
+        job.form_time_in_s = time.time() - time_in_start
+
+        if not ok_in:
+            print("[DISPENSE] WARNING: Draw pump reported failure, but continuing")
+
+        # Read step size and settle time from formulator status
+        try:
+            status_in = self.formulator.get_status()
+            job.calculated_step_size_percent = status_in.get("STEP_SIZE")
+            job.settle_time_used_ms = status_in.get("SETTLE_TIME")
+            job.form_speed_in_mms = status_in.get("SPEED")
+            if job.form_speed_in_mms is None:
+                print("[DISPENSE] IN speed: N/A")
+            else:
+                print(f"[DISPENSE] IN speed: {job.form_speed_in_mms:.4f} mm/s")
+        except Exception as e:
+            print(f"[DISPENSE] WARNING: Could not read IN speed: {e}")
+            job.form_speed_in_mms = None
+        print(f"[DISPENSE] IN time: {job.form_time_in_s:.2f}s")
+        await asyncio.sleep(2)  # Wait for formulator to fully complete
+
+        # -------- STEP 3: Apply pressure relief if enabled, then move valve to its holding state --------
+        if job.relief_enabled and job.volume_ml > 0.3:
+            print(f"[DISPENSE] Step 3a: Applying pressure relief (CLOSED → OUT 1.2% → {end_valve})")
+            # Move valve to CLOSED
+            self.formulator.valve_move("CLOSED")
+            await asyncio.sleep(5)
+            # Get current position and move OUT by 1.0%
+            try:
+                current_pos = self.formulator.get_position()
+                if current_pos is not None:
+                    relief_target = current_pos - 1.2  # Move OUT by 1% for relief
+                    self.formulator.move_to_percent_stepped(relief_target, "OUT", pwm_percent=pwm_out)
+                    print(f"[DISPENSE] Relief: moved from {current_pos:.2f}% to {relief_target:.2f}%")
+                else:
+                    print("[DISPENSE] WARNING: Could not read position for relief calculation")
+            except Exception as e:
+                print(f"[DISPENSE] WARNING: Pressure relief failed: {e}")
+            await asyncio.sleep(1)
+            if end_valve == "THRU":
+                self.formulator.valve_move("THRU")
+                await asyncio.sleep(0.5)
+            # else: relief already left the valve CLOSED
+        else:
+            print(f"[DISPENSE] Step 3: Moving valve to {end_valve} position")
+            self.formulator.valve_move(end_valve)
+            await asyncio.sleep(1)
+
+        # -------- STEP 4: Record actuator position after fill --------
+        try:
+            job.form_percent_pre_dispense = self.formulator.get_position()
+            if job.form_percent_pre_dispense is None:
+                print("[DISPENSE] Form% after fill: N/A")
+            else:
+                print(f"[DISPENSE] Form% after fill: {job.form_percent_pre_dispense:.2f}%")
+        except Exception as e:
+            print(f"[DISPENSE] WARNING: Could not read Form% after fill: {e}")
+            job.form_percent_pre_dispense = None
+
+    async def _do_dispense(self, job, command_volume_ml, profile_token, pwm_out):
+        """Dispense fluid via valve OUT, tare/weigh, and record position after.
+
+        For action="BOTH" the valve is already at THRU and job.form_percent_pre_dispense was
+        already recorded by _do_fill, so this continues straight to taring/dispensing using
+        the full command_volume_ml via the firmware's volume-based PUMP command.
+
+        For action="DISPENSE" the valve starts CLOSED (from an earlier FILL job), so it's
+        opened here first and the current position is read fresh — it may have been set by
+        a different job earlier in the queue. The dispense amount is then applied as a
+        %-delta move from that live position rather than a volume command, since only the
+        firmware's PUMP command knows an absolute home-relative volume — a partial dispense
+        from mid-stroke has to move by percent. The volume feeding that %-delta is corrected
+        via _apply_profile_delta_correction (slope only, no profile_offset) rather than the
+        job's upfront command_volume_ml, since profile_offset is a full-round-trip-only bonus
+        that a partial dispense never reaches. If the requested delta would move past the
+        DEFAULT_HOME_POSITION reference (i.e. not enough fluid remains from the last fill),
+        the move is skipped entirely — the actuator stays exactly where it is — and the job
+        is flagged INSUFFICIENT_VOLUME instead of dispensing a different amount than asked for.
+        """
+        if job.action == "DISPENSE":
+            print("[DISPENSE] Step: Moving valve to THRU position")
+            self.formulator.valve_move("THRU")
+            await asyncio.sleep(1)
+            try:
+                job.form_percent_pre_dispense = self.formulator.get_position()
+                if job.form_percent_pre_dispense is None:
+                    print("[DISPENSE] Form% before OUT: N/A")
+                else:
+                    print(f"[DISPENSE] Form% before OUT: {job.form_percent_pre_dispense:.2f}%")
+            except Exception as e:
+                print(f"[DISPENSE] WARNING: Could not read Form% before OUT: {e}")
+                job.form_percent_pre_dispense = None
+
+        # -------- Tare balance --------
+        print("[DISPENSE] Step: Taring balance")
+        self.balance.tare()
+        await asyncio.sleep(2)
+
+        # -------- Dispense fluid (OUT) --------
+        print("[DISPENSE] Step: Dispensing fluid (OUT)")
+        time_out_start = time.time()
+
+        if job.action == "DISPENSE":
+            current_pos = job.form_percent_pre_dispense
+            if current_pos is None:
+                raise RuntimeError("Could not read actuator position for delta dispense")
+            delta_command_volume_ml = self._apply_profile_delta_correction(job.volume_ml, job.profile_calibration_slope)
+            delta_percent = self._to_firmware_delta_percent(delta_command_volume_ml)
+            target_percent = current_pos - delta_percent
+            job.target_percent = target_percent
+            if target_percent < DEFAULT_HOME_POSITION:
+                print(
+                    f"[DISPENSE] WARNING: Requested {job.volume_ml} mL needs {delta_percent:.2f}% of travel, "
+                    f"but only {current_pos - DEFAULT_HOME_POSITION:.2f}% remains above the "
+                    f"{DEFAULT_HOME_POSITION:.2f}% reference position. Not enough fluid remains — "
+                    f"skipping this dispense (actuator stays at {current_pos:.2f}%) and flagging job "
+                    f"INSUFFICIENT_VOLUME."
+                )
+                job.dispense_status = "INSUFFICIENT_VOLUME"
+                ok_out = False
+            else:
+                ok_out = self.formulator.move_to_percent_stepped(
+                    target_percent,
+                    "OUT",
+                    pwm_percent=pwm_out,
+                    viscosity_profile=profile_token,
+                )
+        else:
+            ok_out = self.formulator.pump_volume(
+                command_volume_ml,
+                "OUT",
+                pwm_percent=pwm_out,
+                viscosity_profile=profile_token,
+            )
+
+        job.form_time_out_s = time.time() - time_out_start
+        if not ok_out and job.dispense_status != "INSUFFICIENT_VOLUME":
+            print("[DISPENSE] WARNING: Dispense pump failed")
+        try:
+            status_out = self.formulator.get_status()
+            job.form_speed_out_mms = status_out.get("SPEED")
+            if job.form_speed_out_mms is None:
+                print("[DISPENSE] OUT speed: N/A")
+            else:
+                print(f"[DISPENSE] OUT speed: {job.form_speed_out_mms:.4f} mm/s")
+        except Exception as e:
+            print(f"[DISPENSE] WARNING: Could not read OUT speed: {e}")
+            job.form_speed_out_mms = None
+        print(f"[DISPENSE] OUT time: {job.form_time_out_s:.2f}s")
+        await asyncio.sleep(2)  # Wait for formulator to fully complete
+
+        # -------- Move valve to CLOSED position --------
+        print("[DISPENSE] Step: Moving valve to CLOSED position")
+        self.formulator.valve_move("CLOSED")
+        await asyncio.sleep(1)
+
+        # -------- Read final weight --------
+        print("[DISPENSE] Step: Reading final weight")
+        weight = self.balance.read_weight(settle_time=10.0)
+        job.actual_weight = weight
+        print(f"[DISPENSE] Target: {job.volume_ml} mL, Actual: {weight:.3f} g")
+
+        # -------- Record actuator position after dispense --------
+        try:
+            job.form_percent_post_dispense = self.formulator.get_position()
+            if job.form_percent_post_dispense is None:
+                print("[DISPENSE] Form% after OUT: N/A")
+            else:
+                print(f"[DISPENSE] Form% after OUT: {job.form_percent_post_dispense:.2f}%")
+        except Exception as e:
+            print(f"[DISPENSE] WARNING: Could not read Form% after OUT: {e}")
+            job.form_percent_post_dispense = None
+
+    async def _do_priming(self, job, profile_token, pwm_in, pwm_out):
+        """Run PRIMING mode's repeated purge cycles, then return the actuator home.
+
+        Each cycle: valve UP -> move IN to PRIMING_IN_TARGET_PERCENT -> wait 7s ->
+        valve THRU -> move OUT to PRIMING_OUT_TARGET_PERCENT -> wait 7s. The number
+        of cycles is job.cycles (set via enqueue(cycles=...), default 1). After all
+        cycles, the actuator returns to DEFAULT_HOME_POSITION and the valve closes.
+        """
+        print(f"[DISPENSE] PRIMING MODE: {job.cycles} cycle(s)")
+        print(f"[DISPENSE] IN target={PRIMING_IN_TARGET_PERCENT:.2f}%, OUT target={PRIMING_OUT_TARGET_PERCENT:.2f}%")
+
+        for cycle in range(1, job.cycles + 1):
+            print(f"\n[DISPENSE] === PRIMING CYCLE {cycle}/{job.cycles} ===")
+
+            # Move valve to UP before IN
+            print(f"[DISPENSE] Cycle {cycle}: Moving valve to UP")
+            self.formulator.valve_move("UP")
+            await asyncio.sleep(1)
+
+            # Move IN to target percent (stepped)
+            print(f"[DISPENSE] Cycle {cycle}: Moving IN to {PRIMING_IN_TARGET_PERCENT:.2f}%")
+            ok_in = self.formulator.move_to_percent_stepped(
+                PRIMING_IN_TARGET_PERCENT,
+                "IN",
+                pwm_percent=pwm_in,
+                viscosity_profile=profile_token,
+            )
+            if not ok_in:
+                print(f"[DISPENSE] WARNING: Cycle {cycle} IN move failed")
+
+            # Wait 7 seconds
+            print(f"[DISPENSE] Cycle {cycle}: Waiting 7s...")
+            await asyncio.sleep(7)
+
+            # Move valve to THRU before OUT
+            print(f"[DISPENSE] Cycle {cycle}: Moving valve to THRU")
+            self.formulator.valve_move("THRU")
+            await asyncio.sleep(1)
+
+            # Move OUT to target percent (stepped)
+            print(f"[DISPENSE] Cycle {cycle}: Moving OUT to {PRIMING_OUT_TARGET_PERCENT:.2f}%")
+            ok_out = self.formulator.move_to_percent_stepped(
+                PRIMING_OUT_TARGET_PERCENT,
+                "OUT",
+                pwm_percent=pwm_out,
+                viscosity_profile=profile_token,
+            )
+            if not ok_out:
+                print(f"[DISPENSE] WARNING: Cycle {cycle} OUT move failed")
+
+            # Wait 7 seconds before next cycle
+            print(f"[DISPENSE] Cycle {cycle}: Waiting 7s...")
+            await asyncio.sleep(7)
+
+        # Move valve to UP before returning home
+        print("[DISPENSE] Moving valve to UP")
+        self.formulator.valve_move("UP")
+        await asyncio.sleep(1)
+
+        # Move IN to home position (stepped)
+        print(f"[DISPENSE] Moving IN to {DEFAULT_HOME_POSITION:.2f}%")
+        ok_in = self.formulator.move_to_percent_stepped(
+            DEFAULT_HOME_POSITION,
+            "IN",
+            pwm_percent=pwm_in,
+            viscosity_profile=profile_token,
+        )
+        if not ok_in:
+            print("[DISPENSE] WARNING: IN move failed")
+
+        # Wait 4 seconds
+        print("[DISPENSE] Waiting 4s...")
+        await asyncio.sleep(4)
+
+        # Close valve at end
+        self.formulator.valve_move("CLOSED")
+        await asyncio.sleep(90)  # Long wait to ensure that the fluid has rested properly before next dispense, especially for high viscosity fluids like Siltech60.
+
+        print(f"\n[DISPENSE] PRIMING MODE: All {job.cycles} cycle(s) completed")
+
     async def _execute_dispense(self, job):
         """Execute a single dispense operation.
-        
+
         Args:
             job: DispenseJob object
         """
@@ -367,7 +713,12 @@ class IntegratedDispenser:
         # Volume correction only needed for NORMAL mode
         if job.operation_mode == "NORMAL":
             command_volume_ml = self._apply_profile_volume_correction(job.volume_ml, profile_offset, profile_slope)
-            target_percent = self._to_firmware_target_percent(command_volume_ml)
+            if job.action in ("FILL", "BOTH"):
+                target_percent = self._to_firmware_target_percent(command_volume_ml)
+            else:
+                # DISPENSE action: target percent is a delta from the live actuator
+                # position, computed later once that position is known
+                target_percent = None
         else:
             # PRIMING mode uses target percentages, not volumes
             command_volume_ml = None
@@ -384,13 +735,14 @@ class IntegratedDispenser:
         job.relief_enabled = relief_enabled
 
         print(f"[DISPENSE] Fluid profile: {profile_key} (firmware={profile_token})")
-        print(f"[DISPENSE] Operation mode: {job.operation_mode}")
-        
+        print(f"[DISPENSE] Operation mode: {job.operation_mode} (action={job.action})")
+
         # Only print volume calibration for NORMAL mode
         if job.operation_mode == "NORMAL":
+            target_str = f"{target_percent:.2f}%" if target_percent is not None else "computed from live position"
             print(
                 f"[DISPENSE] Profile cal: command = desired*slope + offset | offset={profile_offset:.4f}, slope={profile_slope:.4f} | "
-                f"Target={target_percent:.2f}% | Cmd vol={command_volume_ml:.4f} mL | PWM IN/OUT={pwm_in}/{pwm_out}%"
+                f"Target={target_str} | Cmd vol={command_volume_ml:.4f} mL | PWM IN/OUT={pwm_in}/{pwm_out}%"
             )
         else:
             print(
@@ -406,235 +758,18 @@ class IntegratedDispenser:
             
             if job.operation_mode == "NORMAL":
                 # ========== NORMAL DISPENSING MODE ==========
-                
-                # -------- STEP 1: Move valve to UP position --------
-                print("[DISPENSE] Step 1: Moving valve to UP position")
-                self.formulator.valve_move("UP")
-                await asyncio.sleep(1)
+                if job.action in ("FILL", "BOTH"):
+                    await self._do_fill(job, command_volume_ml, profile_token, pwm_in, pwm_out)
 
-                # # -------- STEP 1: Move to loading height --------
-                # print("[DISPENSE] Step 1: Moving to loading height")
-                # self.cnc.move_to_point(x=None, y=None, z=Z_LOAD, speed=Z_MOVE_SPEED)
-                # await asyncio.sleep(1)
-                
-                # -------- STEP 2: Draw fluid (IN) --------
-                print(f"[DISPENSE] Step 2: Drawing {job.volume_ml} mL into formulator")
-                time_in_start = time.time()
-                ok_in = self.formulator.pump_volume(
-                    command_volume_ml,
-                    "IN",
-                    pwm_percent=pwm_in,
-                    viscosity_profile=profile_token,
-                )
-                job.form_time_in_s = time.time() - time_in_start
-                
-                if not ok_in:
-                    print("[DISPENSE] WARNING: Draw pump reported failure, but continuing")
-                
-                # Read step size and settle time from formulator status
-                try:
-                    status_in = self.formulator.get_status()
-                    job.calculated_step_size_percent = status_in.get("STEP_SIZE")
-                    job.settle_time_used_ms = status_in.get("SETTLE_TIME")
-                    job.form_speed_in_mms = status_in.get("SPEED")
-                    if job.form_speed_in_mms is None:
-                        print("[DISPENSE] IN speed: N/A")
-                    else:
-                        print(f"[DISPENSE] IN speed: {job.form_speed_in_mms:.4f} mm/s")
-                except Exception as e:
-                    print(f"[DISPENSE] WARNING: Could not read IN speed: {e}")
-                    job.form_speed_in_mms = None
-                print(f"[DISPENSE] IN time: {job.form_time_in_s:.2f}s")
-                await asyncio.sleep(2)  # Wait for formulator to fully complete
+                if job.action in ("DISPENSE", "BOTH"):
+                    time.sleep(5)
+                    await self._do_dispense(job, command_volume_ml, profile_token, pwm_out)
 
-                # # -------- STEP 3: Move to dispense height --------
-                # print("[DISPENSE] Step 3: Moving to dispense height")
-                # self.cnc.move_to_point(x=None, y=None, z=Z_DISPENSE, speed=Z_MOVE_SPEED)
-                # await asyncio.sleep(5)
-
-                # -------- STEP 3: Apply pressure relief if enabled --------
-                if job.relief_enabled and job.volume_ml > 0.3:
-                    print("[DISPENSE] Step 3a: Applying pressure relief (CLOSED → OUT 1.2% → THRU)")
-                    # Move valve to CLOSED
-                    self.formulator.valve_move("CLOSED")
-                    await asyncio.sleep(5)
-                    # Get current position and move OUT by 1.0%
-                    try:
-                        current_pos = self.formulator.get_position()
-                        if current_pos is not None:
-                            relief_target = current_pos - 1.2  # Move OUT by 1% for relief
-                            self.formulator.move_to_percent_stepped(relief_target, "OUT", pwm_percent=pwm_out)
-                            print(f"[DISPENSE] Relief: moved from {current_pos:.2f}% to {relief_target:.2f}%")
-                        else:
-                            print("[DISPENSE] WARNING: Could not read position for relief calculation")
-                    except Exception as e:
-                        print(f"[DISPENSE] WARNING: Pressure relief failed: {e}")
-                    await asyncio.sleep(1)
-                    # Move valve to THRU
-                    self.formulator.valve_move("THRU")
-                    await asyncio.sleep(0.5)
-                else:
-                    # Just move valve to THRU
-                    print("[DISPENSE] Step 3: Moving valve to THRU position")
-                    self.formulator.valve_move("THRU")
-                    await asyncio.sleep(1)
-
-                # -------- STEP 4: Record actuator position before OUT --------
-                try:
-                    job.form_percent_pre_dispense = self.formulator.get_position()
-                    if job.form_percent_pre_dispense is None:
-                        print("[DISPENSE] Form% before OUT: N/A")
-                    else:
-                        print(f"[DISPENSE] Form% before OUT: {job.form_percent_pre_dispense:.2f}%")
-                except Exception as e:
-                    print(f"[DISPENSE] WARNING: Could not read Form% before OUT: {e}")
-                    job.form_percent_pre_dispense = None
-
-
-                # -------- STEP 5: Tare balance --------
-                print("[DISPENSE] Step 5: Taring balance")
-                self.balance.tare()
-                await asyncio.sleep(2)
-
-                # -------- STEP 6: Dispense fluid (OUT) --------
-                print("[DISPENSE] Step 6: Dispensing fluid (OUT)")
-                time_out_start = time.time()
-                ok_out = self.formulator.pump_volume(
-                    command_volume_ml,
-                    "OUT",
-                    pwm_percent=pwm_out,
-                    viscosity_profile=profile_token,
-                )
-                job.form_time_out_s = time.time() - time_out_start
-                if not ok_out:
-                    print("[DISPENSE] WARNING: Dispense pump failed")
-                try:
-                    status_out = self.formulator.get_status()
-                    job.form_speed_out_mms = status_out.get("SPEED")
-                    if job.form_speed_out_mms is None:
-                        print("[DISPENSE] OUT speed: N/A")
-                    else:
-                        print(f"[DISPENSE] OUT speed: {job.form_speed_out_mms:.4f} mm/s")
-                except Exception as e:
-                    print(f"[DISPENSE] WARNING: Could not read OUT speed: {e}")
-                    job.form_speed_out_mms = None
-                print(f"[DISPENSE] OUT time: {job.form_time_out_s:.2f}s")
-                await asyncio.sleep(2)  # Wait for formulator to fully complete
-
-                # -------- STEP 7: Move valve to CLOSED position --------
-                print("[DISPENSE] Step 7: Moving valve to CLOSED position")
-                self.formulator.valve_move("CLOSED")
-                await asyncio.sleep(1)
-
-                # # -------- STEP 8: Remove fluid from tip post dispense --------
-                # print("[DISPENSE] Step 8: Removing fluid from tip")
-                # self.cnc.move_to_point(x=None, y=13, z=None, speed=200)
-                # await asyncio.sleep(3)
-                # self.cnc.move_to_point(x=None, y=0, z=None, speed=200)
-                # await asyncio.sleep(1)
-                
-                # -------- STEP 9: Read final weight --------
-                print("[DISPENSE] Step 9: Reading final weight")
-                weight = self.balance.read_weight(settle_time=10.0)
-                job.actual_weight = weight
-                print(f"[DISPENSE] Target: {job.volume_ml} mL, Actual: {weight:.3f} g")
-
-                # -------- STEP 10: Record actuator position after dispense --------
-                try:
-                    job.form_percent_post_dispense = self.formulator.get_position()
-                    if job.form_percent_post_dispense is None:
-                        print("[DISPENSE] Form% after OUT: N/A")
-                    else:
-                        print(f"[DISPENSE] Form% after OUT: {job.form_percent_post_dispense:.2f}%")
-                except Exception as e:
-                    print(f"[DISPENSE] WARNING: Could not read Form% after OUT: {e}")
-                    job.form_percent_post_dispense = None
-                
                 job.status = "COMPLETED"
 
             elif job.operation_mode == "PRIMING":
                 # ========== PRIMING MODE ==========
-                # 2 cycles of moved_to IN target, wait 7s, move_to OUT target, wait 7s
-                
-                print(f"[DISPENSE] PRIMING MODE: 2 cycles")
-                print(f"[DISPENSE] IN target={PRIMING_IN_TARGET_PERCENT:.2f}%, OUT target={PRIMING_OUT_TARGET_PERCENT:.2f}%")
-                
-                for cycle in range(1, 2):
-                    print(f"\n[DISPENSE] === PRIMING CYCLE {cycle}/2 ===")
-                    
-                    # Move valve to UP before IN
-                    print(f"[DISPENSE] Cycle {cycle}: Moving valve to UP")
-                    self.formulator.valve_move("UP")
-                    await asyncio.sleep(1)
-                    # self.cnc.move_to_point(x=None, y=None, z=Z_LOAD, speed=Z_MOVE_SPEED)
-                    # await asyncio.sleep(2)
-
-                    # Move IN to target percent (stepped)
-                    print(f"[DISPENSE] Cycle {cycle}: Moving IN to {PRIMING_IN_TARGET_PERCENT:.2f}%")
-                    ok_in = self.formulator.move_to_percent_stepped(
-                        PRIMING_IN_TARGET_PERCENT,
-                        "IN",
-                        pwm_percent=pwm_in,
-                        viscosity_profile=profile_token,
-                    )
-                    if not ok_in:
-                        print(f"[DISPENSE] WARNING: Cycle {cycle} IN move failed")
-                    
-                    # Wait 7 seconds
-                    print(f"[DISPENSE] Cycle {cycle}: Waiting 7s...")
-                    await asyncio.sleep(7)
-                    
-                    # Move valve to THRU before OUT
-                    print(f"[DISPENSE] Cycle {cycle}: Moving valve to THRU")
-                    self.formulator.valve_move("THRU")
-                    await asyncio.sleep(1)
-                    # self.cnc.move_to_point(x=None, y=None, z=Z_DISPENSE, speed=Z_MOVE_SPEED)
-                    # await asyncio.sleep(2)
-                    
-                    # Move OUT to target percent (stepped)
-                    print(f"[DISPENSE] Cycle {cycle}: Moving OUT to {PRIMING_OUT_TARGET_PERCENT:.2f}%")
-                    ok_out = self.formulator.move_to_percent_stepped(
-                        PRIMING_OUT_TARGET_PERCENT,
-                        "OUT",
-                        pwm_percent=pwm_out,
-                        viscosity_profile=profile_token,
-                    )
-                    if not ok_out:
-                        print(f"[DISPENSE] WARNING: Cycle {cycle} OUT move failed")
-                    
-                    # Wait 7 seconds before next cycle
-                    print(f"[DISPENSE] Cycle {cycle}: Waiting 7s...")
-                    await asyncio.sleep(7)
-                
-                # Move valve to UP before IN
-                print(f"[DISPENSE] Moving valve to UP")
-                self.formulator.valve_move("UP")
-                await asyncio.sleep(1)
-                # self.cnc.move_to_point(x=None, y=None, z=Z_LOAD, speed=Z_MOVE_SPEED)
-                # await asyncio.sleep(3)
-                    
-                # Move IN to target percent (stepped)
-                print(f"[DISPENSE] Moving IN to {DEFAULT_HOME_POSITION:.2f}%")
-                ok_in = self.formulator.move_to_percent_stepped(
-                    DEFAULT_HOME_POSITION,
-                    "IN",
-                    pwm_percent=pwm_in,
-                    viscosity_profile=profile_token,
-                )
-                if not ok_in:
-                    print(f"[DISPENSE] WARNING: IN move failed")
-                    
-                # Wait 4 seconds
-                print(f"[DISPENSE] Waiting 4s...")
-                await asyncio.sleep(4)
-                # self.cnc.move_to_point(x=None, y=None, z=Z_DISPENSE, speed=Z_MOVE_SPEED)
-                # await asyncio.sleep(2)
-
-                # Close valve at end
-                self.formulator.valve_move("CLOSED")
-                await asyncio.sleep(90) #Long wait to ensure that the fluid has rested properly before next dispense, especially for high viscosity fluids like Siltech60.
-                
-                print("\n[DISPENSE] PRIMING MODE: All 4 cycles completed")
+                await self._do_priming(job, profile_token, pwm_in, pwm_out)
                 job.status = "COMPLETED"
             if job.timestamp is not None:
                 job.job_duration_s = time.time() - job.timestamp
@@ -676,6 +811,9 @@ class IntegratedDispenser:
             "volume_ml": job.volume_ml,
             "location": job.location or "",
             "status": job.status,
+            "action": job.action,
+            "cycles": job.cycles,
+            "dispense_status": job.dispense_status,
             "target_form_percent": job.target_percent,
             "target_percent": job.target_percent,
             "form_percent_pre_dispense": job.form_percent_pre_dispense,
@@ -831,15 +969,24 @@ async def main():
         # Example: Queue some dispense jobs (each job can specify its own mode)
         print("[MAIN] Queueing dispense jobs...")
         
-        #Queue a PRIMING job (no volume needed)
+        # # #Queue a PRIMING job (no volume needed)
         print("[MAIN] Queueing 1 PRIMING job")
         dispenser.enqueue(operation_mode="PRIMING")
         
         #Queue NORMAL jobs (default mode, volume required)
-        print("[MAIN] Queueing NORMAL jobs")
-        for i in range(10): 
-            dispenser.enqueue(0.15)
-        
+        # print("[MAIN] Queueing NORMAL jobs")
+        # for i in range(3):
+        #     dispenser.enqueue(1)
+
+        # Test pattern: fill once for 5 g, then dispense 0.5 g at a time, 6 times,
+        # each computed as a %-delta move from wherever the actuator currently sits.
+        print("[MAIN] Queueing FILL (5 g) + 6x DISPENSE (0.5 g) test pattern")
+        for u in range(3):
+            dispenser.enqueue(volume_ml=5.2, action="FILL")
+            for i in range(10):
+                dispenser.enqueue(volume_ml=0.2, action="DISPENSE")
+            
+
         
         # Keep running until queue is empty
         while dispenser.queue or dispenser.busy:
