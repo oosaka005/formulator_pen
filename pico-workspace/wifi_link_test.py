@@ -127,18 +127,27 @@ def run_actuator_move_test(driver):
     start_pos = driver.send_raw("POS")
     print(f"  Start position: {start_pos}")
 
+    # Valve must be open on the correct path before commanding fluid motion,
+    # same as the real dispense workflow (UP before drawing IN, THRU before OUT) --
+    # moving the actuator against a CLOSED valve pushes/draws against a blocked
+    # line instead of moving fluid.
+    check_ok(driver, "VALVE:UP", "Valve -> UP (before IN move)", results)
+
     print("  Moving IN to 10% (waiting for the full move + settle to complete)...")
-    ok_in = driver.move_to_percent_stepped(10.0, "IN", pwm_percent=20, viscosity_profile="WATER")
+    ok_in = driver.move_to_percent_stepped(10.0, "IN", pwm_percent=25, viscosity_profile="BLUESILV12")
     results.append(("Step move IN to 10%", ok_in, "completed" if ok_in else "did not complete/settle"))
     print(f"  [{PASS if ok_in else FAIL}] Step move IN to 10%")
     check_prefix(driver, "POS", "POS:", "Position after IN move", results)
 
+    check_ok(driver, "VALVE:THRU", "Valve -> THRU (before OUT move)", results)
+
     print("  Moving OUT to 2% (waiting for the full move + settle to complete)...")
-    ok_out = driver.move_to_percent_stepped(2.0, "OUT", pwm_percent=20, viscosity_profile="WATER")
+    ok_out = driver.move_to_percent_stepped(2.0, "OUT", pwm_percent=25, viscosity_profile="BLUESILV12")
     results.append(("Step move OUT to 2%", ok_out, "completed" if ok_out else "did not complete/settle"))
     print(f"  [{PASS if ok_out else FAIL}] Step move OUT to 2%")
     check_prefix(driver, "POS", "POS:", "Position after OUT move", results)
 
+    check_ok(driver, "VALVE:CLOSED", "Valve -> CLOSED (restore)", results)
     check_ok(driver, "MODE:NORMAL", "Restore mode NORMAL", results)
 
     passed = sum(1 for _, ok, _ in results if ok)
@@ -242,10 +251,10 @@ def main():
         host=args.host,
         port=args.port,
         timeout=args.timeout,
-        # Must comfortably exceed the firmware's own worst case for a single move
-        # (move_timeout_ms=60s + settle_time_ms=10s ~= 70s) -- otherwise the client
-        # times out and gives a false failure while the Pico is still mid-move.
-        pump_timeout_s=120.0,
+        # Generous on purpose: a stepped move can hit MOVE_TIMEOUT_MS (60s) on
+        # more than one struggling step before giving up, so a tight timeout here
+        # can misreport "stalled" when the Pico is still legitimately working.
+        pump_timeout_s=300.0,
         formulator_id=args.formulator_id,
     )
 
