@@ -106,7 +106,7 @@ BALANCE_TIMEOUT = 2.0
 # instead of USB serial. Set FORMULATOR_HOST to the Pico's IP -- either a static
 # IP configured in the firmware's STATIC_IP constant, or a DHCP reservation on
 # your router/Pi5 AP keyed to the Pico's MAC address so it stays stable.
-FORMULATOR_HOST = "192.168.4.101"
+FORMULATOR_HOST = "192.168.10.177"
 FORMULATOR_TCP_PORT = 8888
 FORMULATOR_ID = "formulator1"
 
@@ -890,13 +890,13 @@ async def main():
         print("[MAIN] Queueing dispense jobs...")
         
         #Queue a PRIMING job (no volume needed)
-        print("[MAIN] Queueing 1 PRIMING job")
-        dispenser.enqueue(operation_mode="PRIMING")
+        # print("[MAIN] Queueing 1 PRIMING job")
+        # dispenser.enqueue(operation_mode="PRIMING")
         
         #Queue NORMAL jobs (default mode, volume required)
         print("[MAIN] Queueing NORMAL jobs")
-        for i in range(10): 
-            dispenser.enqueue(0.15)
+        for i in range(3): 
+            dispenser.enqueue(3)
         
         
         # Keep running until queue is empty

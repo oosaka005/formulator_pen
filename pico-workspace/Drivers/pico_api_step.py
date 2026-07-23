@@ -133,7 +133,7 @@ VISCOSITY_OUT_STEP_SIZE_LIMITS = {
 # Actuator hardware configuration (GPIO pins and basic parameters)
 MOTOR_IN1_PIN = 4                    # DRV8871 IN1 control pin
 MOTOR_IN2_PIN = 5                    # DRV8871 IN2 control pin
-MOTOR_FEEDBACK_PIN = 28              # ADC feedback pin for position
+MOTOR_FEEDBACK_PIN = 27              # ADC feedback pin for position (moved from GP28 during diagnosis)
 MOTOR_PWM_FREQ = 1000                # PWM frequency in Hz
 MOTOR_STROKE_MM = 50                # Actuator stroke length in mm
 POSITION_TOLERANCE = 0.3             # Position tolerance in %
@@ -1028,6 +1028,7 @@ class CommandProcessor:
             cooldown = 0 if ready else self.actuator.get_cooldown_time_s()
             return f"READY:{ready},COOLDOWN={cooldown:.1f}"
 
+        ##For this part here, the logic/proceedure probably needs to be revised to have a more robust and clear command structure. The current implementation is functional but could be improved for clarity and maintainability.
         elif command.startswith("SETPROFILE:"):
             try:
                 parts = command.split(":", 1)[1].split(",")

@@ -155,6 +155,46 @@ def run_actuator_move_test(driver):
     return passed == len(results)
 
 
+def run_position_monitor(driver):
+    """Continuously poll and print STATUS (position %, raw ADC counts, duty)
+    without moving anything. Purely read-only diagnostic.
+
+    Useful for isolating a feedback-wiring/hardware fault from a software issue:
+    move the actuator BY HAND (if safe to do so) while this runs and watch
+    whether the printed position/ADC value tracks the real physical movement
+    at all. If it never changes no matter how far you move it, that points at
+    the feedback wire/connector rather than anything in this codebase. If it
+    changes but inconsistently/noisily, that's a different class of problem
+    (wiring picking up noise, bad connection, etc.) than a clean disconnect.
+    """
+    print("\n=== Live position monitor (read-only, moves nothing) ===")
+    print("Polling STATUS repeatedly. If safe, move the actuator by hand and watch")
+    print("whether POS/ADC below tracks the real physical movement.")
+    print("Press Ctrl-C to stop.\n")
+
+    last_percent = None
+    unchanged_count = 0
+    try:
+        while True:
+            status = driver.send_raw("STATUS")
+            note = ""
+            try:
+                percent = float(status.split("POS=")[1].split(",")[0])
+                if last_percent is not None and abs(percent - last_percent) < 0.05:
+                    unchanged_count += 1
+                else:
+                    unchanged_count = 0
+                last_percent = percent
+                if unchanged_count >= 10:
+                    note = "  <-- unchanged for 5+ readings"
+            except (IndexError, ValueError):
+                note = "  <-- could not parse POS from response"
+            print(f"{status}{note}")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
 def run_reset_test(driver, host, port, formulator_id):
     """Exercises RESET end-to-end: sends it, then confirms the Pico actually
     reboots and comes back up on WiFi (not just that it accepted the command)."""
@@ -181,7 +221,7 @@ def run_reset_test(driver, host, port, formulator_id):
             if ready.startswith("READY:"):
                 print(f"  [PASS] Pico back online after reset (attempt {attempt}) -> {ready!r}")
                 return True
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError):
             pass
         print(f"  ... retry {attempt}/10")
         time.sleep(2)
@@ -268,7 +308,8 @@ def main():
             print("  2) Actuator movement test (real motion, confirms first)")
             print("  3) Reset test (reboots the Pico, confirms it comes back)")
             print("  4) Interactive console (raw commands)")
-            print("  5) Quit")
+            print("  5) Live position monitor (read-only, move actuator by hand)")
+            print("  6) Quit")
             choice = input("Choose: ").strip()
 
             if choice == "1":
@@ -280,6 +321,8 @@ def main():
             elif choice == "4":
                 run_interactive_console(driver)
             elif choice == "5":
+                run_position_monitor(driver)
+            elif choice == "6":
                 break
             else:
                 print("Unrecognized choice.")
