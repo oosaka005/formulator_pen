@@ -4,7 +4,7 @@ Integrated Formulator/CNC/Balance Dispensing System - Pi5 Version
 
 Main orchestration file combining:
 - CNC motion control (Genmitsu 4040 Pro via GRBL)
-- Dispensing Formulator (Pico W via serial)
+- Dispensing Formulator (Pico W via WiFi/TCP)
 - Balance/scale readings (serial)
 
 Queue-based workflow with async processing.
@@ -14,10 +14,13 @@ FILES USED:
 Python Drivers (PC-side):
   • Drivers/cnc_api.py          - CNC motion control (G-code generation, GRBL communication)
   • Drivers/balance_api.py       - Balance/scale serial interface (read weight, tare, zero)
-  • Drivers/formulator_driver.py - Pico formulator serial wrapper (send commands, receive status)
+  • Drivers/formulator_driver.py - Pico formulator WiFi/TCP wrapper (send commands, receive status)
 
-Pico Firmware (upload to Pico W):
-  • Drivers/formulator_pico_api.py - MicroPython firmware for Pico (hardware control: valve, actuator)
+Pico Firmware (upload to Pico W, once):
+  • Drivers/pico_api_step.py - MicroPython firmware for Pico W (hardware control: valve, actuator,
+    WiFiCommandHandler). Fixed hardware config lives here; per-fluid step-limit profiles and the
+    currently-selected fluid are pushed at runtime from this file instead (see FLUID_PROFILES /
+    sync_all_fluid_profiles below) so adding/tuning a fluid never requires reflashing.
 
 Main Orchestration:
   • main_dispense_system.py      - This file (DispenseJob, IntegratedDispenser, queue processing)
@@ -31,29 +34,33 @@ SETUP/PREREQUISITES:
 1. Hardware connections:
     - CNC: Connect via USB serial (Windows COMx, Linux /dev/ttyUSBx or /dev/serial/by-id/...)
     - Balance: Connect via its serial device path
-    - Dispensing Formulator (Pico W): Connect via USB serial
+    - Dispensing Formulator (Pico W): WiFi only -- no USB cable needed at runtime
 
 2. Lock the tool (Formulator Pen) in place using the tool_changer.py script before running this file.
 
 3. Before running main_dispense_system.py:
-   Step A: Upload Pico firmware
-   ───────────────────────────
+   Step A: Upload Pico firmware (one-time, or after a firmware change)
+   ─────────────────────────────────────────────────────────────────
    - Connect Pico W to PC via USB
-   - Use Thonny IDE or mpremote to upload formulator_pico_api.py to Pico
-   - Command example: mpremote cp Drivers/formulator_pico_api.py :main.py
-   - Restart Pico (or it will auto-start main.py)
-   
+   - Edit Drivers/pico_api_step.py's WIFI_SSID/WIFI_PASSWORD/FORMULATOR_ID (and STATIC_IP if used)
+     for this specific physical unit before uploading
+   - Use Thonny IDE or mpremote to upload pico_api_step.py to the Pico
+   - Command example: mpremote cp Drivers/pico_api_step.py :main.py
+   - Restart Pico (or it will auto-start main.py) and it will connect to WiFi automatically
+   - To reset it later without USB, use formulator.reset() (sends RESET over the WiFi link)
+
    Step B: Create/update config files
     ──────────────────────────────────
     - Update config.yaml with CNC settings and serial device path
     - Create positions.csv with named locations (VIAL_1, VIAL_2, WB, etc)
-    - Update hardware serial settings below if any USB device changes
-   
-   Step C: Verify serial connections
-   ─────────────────────────────────
+    - Update FORMULATOR_HOST below to match the Pico's IP address
+
+   Step C: Verify connections
+   ───────────────────────────
    - Test CNC: Open terminal, verify GRBL responds to '?'
    - Test Balance: Run balance_api.py separately, verify tare/read works
-   - Test Pico: Check serial terminal for "[SERIAL] Command handler ready"
+   - Test Pico: Watch its USB serial console (for setup/debug only) for "[WIFI] Connected. IP=..."
+     and "WiFi command handler ready", then confirm FORMULATOR_HOST below matches that IP
 
 4. Run this file:
    ───────────────
@@ -95,8 +102,13 @@ BALANCE_PORT = "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Contro
 BALANCE_BAUD = 9600
 BALANCE_TIMEOUT = 2.0
 
-FORMULATOR_PORT = "/dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_e66368254f52132d-if00"
-FORMULATOR_BAUD = 115200
+# Formulator now talks over WiFi (see Drivers/pico_api_step.py WiFiCommandHandler)
+# instead of USB serial. Set FORMULATOR_HOST to the Pico's IP -- either a static
+# IP configured in the firmware's STATIC_IP constant, or a DHCP reservation on
+# your router/Pi5 AP keyed to the Pico's MAC address so it stays stable.
+FORMULATOR_HOST = "192.168.10.177"
+FORMULATOR_TCP_PORT = 8888
+FORMULATOR_ID = "formulator1"
 
 # Formulator Calibration (reference profile used by firmware)
 # Formula: target_percent = (volume_ml + CALIBRATION_OFFSET) / CALIBRATION_SLOPE
@@ -126,6 +138,10 @@ PRIMING_OUT_TARGET_PERCENT = 2.0
 #   main inverts this fit to get commanded from desired:
 #     commanded = (desired - calibration_offset) / calibration_slope
 # - pwm_in_percent / pwm_out_percent: per-direction actuator speed
+# - in_/out_ step-limit fields: this is the "step limit profile" data that used to
+#   live hardcoded in the Pico firmware (VISCOSITY_IN/OUT_STEP_SIZE_LIMITS). It now
+#   lives here and gets pushed to the Pico at runtime via sync_all_fluid_profiles()
+#   below, so adding/tuning a fluid no longer requires reflashing firmware.
 #
 # Keep the reference profile at offset=0, slope=1 (no correction).
 FLUID_PROFILES = {
@@ -136,6 +152,8 @@ FLUID_PROFILES = {
         "pwm_in_percent": 30,
         "pwm_out_percent": 30,
         "relief_enabled": False,
+        "in_enabled": False, "in_min_step": 0.1, "in_max_step": 3.0, "in_pause_ms": 0,
+        "out_enabled": False, "out_min_step": 1.0, "out_max_step": 3.0, "out_pause_ms": 0,
     },
     "GLYCERIN": {
         "formulator_profile": "GLYCERIN",
@@ -144,6 +162,8 @@ FLUID_PROFILES = {
         "pwm_in_percent": 30,
         "pwm_out_percent": 30,
         "relief_enabled": False,
+        "in_enabled": True, "in_min_step": 1.0, "in_max_step": 3.0, "in_pause_ms": 2000,
+        "out_enabled": False, "out_min_step": 1.0, "out_max_step": 3.0, "out_pause_ms": 0,
     },
     "BLUESIL": {
         "formulator_profile": "BLUESIL",
@@ -152,6 +172,8 @@ FLUID_PROFILES = {
         "pwm_in_percent": 25,
         "pwm_out_percent": 30,
         "relief_enabled": True,
+        "in_enabled": True, "in_min_step": 0.6, "in_max_step": 2.4, "in_pause_ms": 4000,
+        "out_enabled": True, "out_min_step": 0.6, "out_max_step": 42.0, "out_pause_ms": 4000,
     },
     "BLUESILV12": {
         "formulator_profile": "BLUESILV12",
@@ -160,6 +182,8 @@ FLUID_PROFILES = {
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
+        "in_enabled": True, "in_min_step": 0.3, "in_max_step": 3.6, "in_pause_ms": 3000,
+        "out_enabled": True, "out_min_step": 0.3, "out_max_step": 10.0, "out_pause_ms": 5000,
     },
     "BLUESILV30": {
         "formulator_profile": "BLUESILV30",
@@ -168,6 +192,8 @@ FLUID_PROFILES = {
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
+        "in_enabled": True, "in_min_step": 0.6, "in_max_step": 1.2, "in_pause_ms": 5000,
+        "out_enabled": True, "out_min_step": 0.6, "out_max_step": 8.0, "out_pause_ms": 5000,
     },
     "SILTECH60": {
         "formulator_profile": "SILTECH60",
@@ -176,6 +202,8 @@ FLUID_PROFILES = {
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
+        "in_enabled": True, "in_min_step": 0.4, "in_max_step": 1.2, "in_pause_ms": 1500,
+        "out_enabled": True, "out_min_step": 0.6, "out_max_step": 8.0, "out_pause_ms": 5000,
     },
      "BLUESILV60": {
         "formulator_profile": "BLUESILV60",
@@ -184,8 +212,31 @@ FLUID_PROFILES = {
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
+        "in_enabled": True, "in_min_step": 0.4, "in_max_step": 1.2, "in_pause_ms": 5000,
+        "out_enabled": True, "out_min_step": 0.6, "out_max_step": 8.0, "out_pause_ms": 7000,
     },
 }
+
+
+def sync_all_fluid_profiles(formulator):
+    """Push every FLUID_PROFILES entry's step-limit config down to the Pico.
+
+    Call once after connecting -- the Pico then has all fluids' step-limit
+    profiles cached in RAM, and per-job code only needs to select which one
+    is active (via set_default_fluid / the profile token passed per command).
+    """
+    print("[INIT] Syncing fluid step-limit profiles to formulator...")
+    for key, profile in FLUID_PROFILES.items():
+        token = str(profile.get("formulator_profile", key)).strip().upper()
+        ok = formulator.sync_fluid_profile(
+            token,
+            in_min_step=profile["in_min_step"], in_max_step=profile["in_max_step"],
+            in_pause_ms=profile["in_pause_ms"], in_enabled=profile["in_enabled"],
+            out_min_step=profile["out_min_step"], out_max_step=profile["out_max_step"],
+            out_pause_ms=profile["out_pause_ms"], out_enabled=profile["out_enabled"],
+        )
+        if not ok:
+            print(f"[INIT] WARNING: Failed to sync profile {token}")
 
 # Z-Only Motion (No XY moves for now)
 # Update these Z positions for your setup.
@@ -755,6 +806,11 @@ class IntegratedDispenser:
             if not self.formulator.set_operation_mode(job.operation_mode):
                 raise RuntimeError(f"Failed to set formulator mode: {job.operation_mode}")
             await asyncio.sleep(0.5)
+
+            # Mark this as the currently-selected fluid on the Pico (runtime state,
+            # not firmware-fixed) -- also used as fallback if a bare command omits
+            # the profile token.
+            self.formulator.set_default_fluid(profile_token)
             
             if job.operation_mode == "NORMAL":
                 # ========== NORMAL DISPENSING MODE ==========
@@ -947,12 +1003,14 @@ async def main():
     
     print("[INIT] Initializing formulator...")
     formulator = FormulatorDriver(
-        serial_port=FORMULATOR_PORT,
-        baud_rate=FORMULATOR_BAUD,
+        host=FORMULATOR_HOST,
+        port=FORMULATOR_TCP_PORT,
         pump_timeout_s=2000.0,
+        formulator_id=FORMULATOR_ID,
     )
     formulator.open()
     await asyncio.sleep(1)
+    sync_all_fluid_profiles(formulator)
     
     # -------- Create dispenser and start processing --------
     dispenser = IntegratedDispenser(
@@ -970,23 +1028,21 @@ async def main():
         print("[MAIN] Queueing dispense jobs...")
         
         # # #Queue a PRIMING job (no volume needed)
-        print("[MAIN] Queueing 1 PRIMING job")
-        dispenser.enqueue(operation_mode="PRIMING")
-        
-        #Queue NORMAL jobs (default mode, volume required)
+        # print("[MAIN] Queueing 1 PRIMING job")
+        # dispenser.enqueue(operation_mode="PRIMING")
+
+        #Queue NORMAL jobs (default mode, volume required, action="BOTH")
         # print("[MAIN] Queueing NORMAL jobs")
         # for i in range(3):
-        #     dispenser.enqueue(1)
+        #     dispenser.enqueue(3)
 
-        # Test pattern: fill once for 5 g, then dispense 0.5 g at a time, 6 times,
+        # Test pattern: fill once for 5.2 mL, then dispense 0.2 mL at a time, 10 times,
         # each computed as a %-delta move from wherever the actuator currently sits.
-        print("[MAIN] Queueing FILL (5 g) + 6x DISPENSE (0.5 g) test pattern")
+        print("[MAIN] Queueing FILL (5.2 mL) + 10x DISPENSE (0.2 mL) test pattern")
         for u in range(3):
             dispenser.enqueue(volume_ml=5.2, action="FILL")
             for i in range(10):
                 dispenser.enqueue(volume_ml=0.2, action="DISPENSE")
-            
-
         
         # Keep running until queue is empty
         while dispenser.queue or dispenser.busy:

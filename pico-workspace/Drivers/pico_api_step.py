@@ -1,23 +1,31 @@
 """====================================================
-Formulator Dispenser Driver API (Pico MicroPython)
+Formulator Dispenser Driver API (Pico W MicroPython)
 Pico W + MG92B Valve + Actuonix L16 + DRV8871
 ====================================================
 
-Driver-style API for powder formulation dispensing system with three main classes:
+Driver-style API for powder formulation dispensing system with these main classes:
 - Valve: Servo-controlled valve with positions (UP, CLOSED, THRU)
 - Actuator: Linear actuator with position feedback and duty cycle protection
-- SerialCommandHandler: Listens for PC commands over serial
+- CommandProcessor: Shared command parser/dispatcher (transport-agnostic)
+- WiFiCommandHandler: Listens for PC commands over a WiFi TCP socket (primary transport)
+- SerialCommandHandler: Listens for PC commands over USB serial (legacy/bench-debug fallback)
 
-This firmware runs on the Pico and receives commands from the PC via serial.
-Commands: VALVE:<pos>, PUMP:<volume>,<dir>[,<pwm>], POS, STATUS, READY?
+This firmware runs on the Pico W and receives commands from the Pi5 over WiFi.
+Commands: VALVE:<pos>, PUMP:<volume>,<dir>[,<pwm>], POS, STATUS, READY?, RESET,
+SETPROFILE:<name>,<IN|OUT>,<enabled>,<min>,<max>,<pause_ms>, SETFLUID:<name>
 
-To use: Upload this file to Pico, call main() at the end.
+To use: Upload this file to the Pico (once, via mpremote), call main() at the end.
+Only the WIFI_SSID/WIFI_PASSWORD/FORMULATOR_ID/STATIC_IP block below needs to differ
+per physical unit -- everything else is shared firmware.
 """
 
 import uasyncio as asyncio
 from machine import Pin, PWM, ADC
+import machine
 import time
 import sys
+import network
+import socket
 
 
 # =====================================================
@@ -125,7 +133,7 @@ VISCOSITY_OUT_STEP_SIZE_LIMITS = {
 # Actuator hardware configuration (GPIO pins and basic parameters)
 MOTOR_IN1_PIN = 4                    # DRV8871 IN1 control pin
 MOTOR_IN2_PIN = 5                    # DRV8871 IN2 control pin
-MOTOR_FEEDBACK_PIN = 28              # ADC feedback pin for position
+MOTOR_FEEDBACK_PIN = 27              # ADC feedback pin for position (moved from GP28 during diagnosis)
 MOTOR_PWM_FREQ = 1000                # PWM frequency in Hz
 MOTOR_STROKE_MM = 50                # Actuator stroke length in mm
 POSITION_TOLERANCE = 0.3             # Position tolerance in %
@@ -144,6 +152,39 @@ SERVO_POSITIONS = {
     "CLOSED": 68,    # Closed/neutral position
     "THRU": 112,     # Dispense position (through to output)
 }
+
+# =====================================================
+# WIRELESS COMMUNICATION CONFIG
+# =====================================================
+# Per-unit identity: change these per physical Pico when running more than one.
+# Addressing multiple Picos on one WiFi network is just "each gets its own IP" --
+# no shared-bus addressing scheme needed. FORMULATOR_ID is only used for log lines.
+FORMULATOR_ID = "formulator1"
+
+WIFI_SSID = "AC-IoT-Cudy-18DC"
+WIFI_PASSWORD = "31185981"
+
+# Leave STATIC_IP as None to use DHCP (simplest -- pair with a DHCP reservation on
+# your router/Pi5 AP keyed to this board's MAC address so the IP stays stable).
+# Or set a tuple (ip, subnet, gateway, dns) to force a static IP on this Pico,
+# e.g. ("192.168.4.101", "255.255.255.0", "192.168.4.1", "192.168.4.1").
+STATIC_IP = None
+
+FORMULATOR_TCP_PORT = 8888
+
+# WiFi power-management: disabling this avoids a known CYW43439/MicroPython bug
+# where the chip misses power-save rekeying and silently stops decrypting traffic.
+WIFI_DISABLE_POWERSAVE = True
+
+# Hardware watchdog: if the whole event loop wedges (known occasional issue with
+# the Pico W WiFi stack), auto-reboot rather than staying silently frozen mid-move.
+# RP2040's hardware watchdog is hard-capped at ~8.3s, so there's very little margin
+# above WATCHDOG_TIMEOUT_MS -- if any real (non-loopback) WiFi/socket call ever
+# legitimately takes longer than that to yield back to the scheduler, this fires
+# and hard-resets the board mid-move. Left OFF by default until the WiFi link is
+# proven reliable under real bench conditions; flip to True once confirmed solid.
+ENABLE_WATCHDOG = False
+WATCHDOG_TIMEOUT_MS = 8000
 
 
 # =====================================================
@@ -253,6 +294,11 @@ class Actuator:
         self.operation_mode = "NORMAL"
         self.safe_min_percent = 0.0
         self.safe_max_percent = 100.0
+
+        # Currently selected fluid/profile, settable at runtime from the Pi5 (SETFLUID)
+        # instead of being hardcoded in firmware. Falls back to DEFAULT_VISCOSITY_PROFILE
+        # when unset and no explicit profile is passed with a command.
+        self.runtime_default_profile = None
         self.adc_max = 65535
         self.adc_min_usable = 0
         self.adc_max_usable = 65535
@@ -660,9 +706,36 @@ class Actuator:
         print(f"[ACTUATOR] Stepped move failed at end (final {final_pos:.2f}%, target {target:.2f}%, err {final_error:.2f}%)")
         return False
 
+    def set_default_profile(self, name):
+        """Set the runtime-default fluid/viscosity profile (Pi5-controlled, not firmware-fixed)."""
+        self.runtime_default_profile = str(name).strip().upper() if name else None
+        print(f"[ACTUATOR] Default fluid profile -> {self.runtime_default_profile}")
+
+    def set_viscosity_profile(self, direction, name, enabled, min_step, max_step, pause_ms):
+        """Add or update a viscosity step-limit profile entry at runtime.
+
+        Lets the Pi5 push/tune step-limit profiles (per fluid) without reflashing
+        firmware -- the module-level tables below only serve as firmware defaults.
+        """
+        direction = str(direction).strip().upper()
+        name = str(name).strip().upper()
+        entry = {
+            "enabled": bool(enabled),
+            "min": max(0.01, float(min_step)),
+            "max": max(float(min_step), float(max_step)),
+            "pause_ms": max(0, int(pause_ms)),
+        }
+        if direction == "IN":
+            VISCOSITY_IN_STEP_SIZE_LIMITS[name] = entry
+        elif direction == "OUT":
+            VISCOSITY_OUT_STEP_SIZE_LIMITS[name] = entry
+        else:
+            raise ValueError("direction must be IN or OUT")
+        print(f"[ACTUATOR] Profile {name} {direction} updated: {entry}")
+
     def _resolve_step_size_limits(self, direction, viscosity_profile=None):
         """Resolve stepping enabled flag, min/max step size, and inter-step pause from profile."""
-        profile = (viscosity_profile or DEFAULT_VISCOSITY_PROFILE).strip().upper()
+        profile = (viscosity_profile or self.runtime_default_profile or DEFAULT_VISCOSITY_PROFILE).strip().upper()
         if direction == "IN":
             limits = VISCOSITY_IN_STEP_SIZE_LIMITS.get(
                 profile,
@@ -813,55 +886,29 @@ class Dispenser:
 
 
 # =====================================================
-# SERIAL COMMAND HANDLER
+# COMMAND PROCESSOR (shared, transport-agnostic)
 # =====================================================
 
-class SerialCommandHandler:
-    """Listen for serial commands from PC and execute them.
-    
+class CommandProcessor:
+    """Parses and dispatches PC commands against a Valve + Actuator.
+
+    Shared by both transports (WiFi and legacy serial) so the command set only
+    needs to be maintained in one place.
+
     Args:
         valve: Valve instance
         actuator: Actuator instance
     """
-    
+
     def __init__(self, valve, actuator):
         self.valve = valve
         self.actuator = actuator
         self.last_error = None
-
-    async def listen(self):
-        """Main loop: listen for commands and respond."""
-        print("[SERIAL] Command handler ready")
-        print("[SERIAL] Available commands:")
-        print("  VALVE:<UP|CLOSED|THRU>     - Move valve to position")
-        print("  PUMP:<volume>,<IN|OUT>[,<pwm>][,<profile|steps>] - profile: LOW|MEDIUM|HIGH")
-        print("  MODE:<NORMAL|PRIMING>      - Set actuator mode and soft limits")
-        print("  STEP:<target%>,<IN|OUT>[,<pwm>][,<profile|steps>] - Stepped move to explicit target")
-        print("  POS                        - Get current position %")
-        print("  STATUS                     - Get system status (duty cycle, etc)")
-        print("  READY?                     - Check if ready for commands")
-        print()
-        
-        while True:
-            # Check for incoming data
-            if sys.stdin in __import__('select').select([sys.stdin], [], [], 0)[0]:
-                try:
-                    line = sys.stdin.readline().strip()
-                    if not line:
-                        continue
-                    
-                    response = await self._process_command(line)
-                    print(response)
-                    
-                except Exception as e:
-                    self.last_error = str(e)
-                    print(f"ERROR:{e}")
-            
-            await asyncio.sleep_ms(50)
+        self.reset_requested = False
 
     async def _process_command(self, command):
         """Process a single command and return response."""
-        
+
         if command.startswith("VALVE:"):
             position = command.split(":")[1].strip()
             ok = await self.valve.move(position)
@@ -986,9 +1033,210 @@ class SerialCommandHandler:
             ready = self.actuator.can_run_motor()
             cooldown = 0 if ready else self.actuator.get_cooldown_time_s()
             return f"READY:{ready},COOLDOWN={cooldown:.1f}"
-        
+
+        ##For this part here, the logic/proceedure probably needs to be revised to have a more robust and clear command structure. The current implementation is functional but could be improved for clarity and maintainability.
+        elif command.startswith("SETPROFILE:"):
+            try:
+                parts = command.split(":", 1)[1].split(",")
+                name = parts[0].strip()
+                direction = parts[1].strip().upper()
+                enabled = parts[2].strip() in ("1", "true", "True", "TRUE")
+                min_step = float(parts[3].strip())
+                max_step = float(parts[4].strip())
+                pause_ms = int(parts[5].strip())
+                self.actuator.set_viscosity_profile(direction, name, enabled, min_step, max_step, pause_ms)
+                return "OK"
+            except (IndexError, ValueError) as e:
+                return f"ERROR:Invalid format - use SETPROFILE:<name>,<IN|OUT>,<enabled 0|1>,<min>,<max>,<pause_ms> ({e})"
+
+        elif command.startswith("SETFLUID:"):
+            name = command.split(":", 1)[1].strip()
+            self.actuator.set_default_profile(name if name else None)
+            return "OK"
+
+        elif command == "RESET":
+            self.reset_requested = True
+            return "OK"
+
         else:
             return f"ERROR:Unknown command '{command}'"
+
+
+# =====================================================
+# SERIAL COMMAND HANDLER (legacy / USB bench-debug fallback)
+# =====================================================
+
+class SerialCommandHandler(CommandProcessor):
+    """Listen for commands over USB serial. Kept as a fallback debug transport --
+    WiFiCommandHandler below is the primary transport used in main()."""
+
+    async def listen(self):
+        """Main loop: listen for commands and respond."""
+        print("[SERIAL] Command handler ready (fallback transport)")
+        print()
+
+        while True:
+            # Check for incoming data
+            if sys.stdin in __import__('select').select([sys.stdin], [], [], 0)[0]:
+                try:
+                    line = sys.stdin.readline().strip()
+                    if not line:
+                        continue
+
+                    response = await self._process_command(line)
+                    print(response)
+                    if self.reset_requested:
+                        await asyncio.sleep_ms(200)
+                        machine.reset()
+
+                except Exception as e:
+                    self.last_error = str(e)
+                    print(f"ERROR:{e}")
+
+            await asyncio.sleep_ms(50)
+
+
+# =====================================================
+# WIFI COMMAND HANDLER (primary transport)
+# =====================================================
+
+class WiFiCommandHandler(CommandProcessor):
+    """Listen for commands from the Pi5 over a WiFi TCP socket.
+
+    Holds one persistent client connection at a time (matching how the Pi5-side
+    driver opens once and reuses the link, same as the previous serial workflow).
+    A background task keeps re-associating with WiFi if the link drops.
+    """
+
+    def __init__(self, valve, actuator, ssid=WIFI_SSID, password=WIFI_PASSWORD,
+                 port=FORMULATOR_TCP_PORT, static_ip=STATIC_IP):
+        super().__init__(valve, actuator)
+        self.ssid = ssid
+        self.password = password
+        self.port = port
+        self.static_ip = static_ip
+        self.wlan = network.WLAN(network.STA_IF)
+
+    async def connect_wifi(self):
+        """Bring up WiFi and block until associated (retries indefinitely)."""
+        self.wlan.active(True)
+        if WIFI_DISABLE_POWERSAVE:
+            self.wlan.config(pm=0xa11140)  # disable power-save: avoids a known
+            # CYW43439/MicroPython bug where the chip misses power-save rekeying
+            # and silently stops decrypting traffic.
+        if self.static_ip is not None:
+            self.wlan.ifconfig(self.static_ip)
+
+        while not self.wlan.isconnected():
+            print(f"[WIFI] Connecting to '{self.ssid}'...")
+            self.wlan.connect(self.ssid, self.password)
+            for _ in range(20):  # ~10s per attempt
+                if self.wlan.isconnected():
+                    break
+                await asyncio.sleep_ms(500)
+
+        print(f"[WIFI] Connected. IP={self.wlan.ifconfig()[0]}")
+
+    async def _reconnect_monitor(self):
+        """Background task: re-associate if the WiFi link drops."""
+        while True:
+            if not self.wlan.isconnected():
+                print("[WIFI] Link dropped, reconnecting...")
+                await self.connect_wifi()
+            await asyncio.sleep_ms(2000)
+
+    async def listen(self):
+        """Accept one client at a time and process newline-terminated commands."""
+        await self.connect_wifi()
+        asyncio.create_task(self._reconnect_monitor())
+
+        addr = socket.getaddrinfo("0.0.0.0", self.port)[0][-1]
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(addr)
+        server.listen(1)
+        server.setblocking(False)
+
+        print(f"[{FORMULATOR_ID}] WiFi command handler ready on port {self.port}")
+        print("[WIFI] Available commands:")
+        print("  VALVE:<UP|CLOSED|THRU>     - Move valve to position")
+        print("  PUMP:<volume>,<IN|OUT>[,<pwm>][,<profile|steps>]")
+        print("  MODE:<NORMAL|PRIMING>      - Set actuator mode and soft limits")
+        print("  STEP:<target%>,<IN|OUT>[,<pwm>][,<profile|steps>]")
+        print("  SETPROFILE:<name>,<IN|OUT>,<enabled>,<min>,<max>,<pause_ms>")
+        print("  SETFLUID:<name>            - Set runtime-default fluid profile")
+        print("  POS / STATUS / READY?      - Telemetry")
+        print("  RESET                      - Reboot the Pico")
+        print()
+
+        while True:
+            conn = None
+            try:
+                conn, remote_addr = server.accept()
+            except OSError:
+                pass  # no pending connection
+
+            if conn is not None:
+                conn.setblocking(False)
+                print(f"[WIFI] Client connected: {remote_addr}")
+                await self._handle_connection(conn)
+
+            await asyncio.sleep_ms(50)
+
+    async def _handle_connection(self, conn):
+        """Service one client connection until it disconnects or errors out."""
+        buf = b""
+        try:
+            while True:
+                data = None
+                try:
+                    data = conn.recv(256)
+                except OSError as e:
+                    if e.args[0] in (11, 35):  # EAGAIN/EWOULDBLOCK -- no data yet
+                        data = None
+                    else:
+                        raise
+
+                if data:
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.decode().strip()
+                        if not line:
+                            continue
+                        try:
+                            response = await self._process_command(line)
+                        except Exception as e:
+                            self.last_error = str(e)
+                            response = f"ERROR:{e}"
+                        conn.send((response + "\n").encode())
+                        if self.reset_requested:
+                            await asyncio.sleep_ms(200)  # let the response flush out
+                            machine.reset()
+                elif data == b"":
+                    print("[WIFI] Client disconnected")
+                    return
+
+                await asyncio.sleep_ms(20)
+        except OSError as e:
+            print(f"[WIFI] Connection error: {e}")
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+async def wdt_feeder(wdt):
+    """Keep feeding the hardware watchdog for as long as the event loop is alive.
+
+    If the whole loop wedges (known occasional Pico W WiFi stack issue), this task
+    stops running too, the watchdog times out, and the board auto-reboots instead
+    of sitting silently frozen mid-move.
+    """
+    while True:
+        wdt.feed()
+        await asyncio.sleep_ms(1000)
 
 
 # =====================================================
@@ -997,20 +1245,23 @@ class SerialCommandHandler:
 
 async def main():
     """Initialize hardware and start command handler."""
-    print("\n=== Formulator Firmware (Pico) ===\n")
+    print(f"\n=== Formulator Firmware ({FORMULATOR_ID}) ===\n")
     await asyncio.sleep(1)
 
     # Initialize hardware
     valve = Valve()
     actuator = Actuator(in1_pin=4, in2_pin=5)  # Match hardware wiring
     actuator.set_operation_mode("NORMAL")
-    serial_handler = SerialCommandHandler(valve, actuator)
+    wifi_handler = WiFiCommandHandler(valve, actuator)
 
-    # Start command handler
+    if ENABLE_WATCHDOG:
+        wdt = machine.WDT(timeout=WATCHDOG_TIMEOUT_MS)
+        asyncio.create_task(wdt_feeder(wdt))
+
     await valve.move("CLOSED")
-    
-    # Main loop: listen for PC commands
-    await serial_handler.listen()
+
+    # Main loop: listen for Pi5 commands over WiFi
+    await wifi_handler.listen()
 
 
 if __name__ == "__main__":
