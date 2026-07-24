@@ -64,50 +64,6 @@ SETTLE_ONLY_ON_FINAL_STEP = True
 # Dynamic stepping config: each move is split into the minimum number of steps
 # such that every step is <= max_step_percent. If the resulting step size is
 # below min_step_percent, the move is executed as a single step.
-#These values could be possibly further optimized to improve throughput, I just chose safer values based on visual observation.
-# VISCOSITY_IN_STEP_SIZE_LIMITS = {
-#     "WATER": {"enabled": False, "min": 0.1, "max": 3.0, "pause_ms": 0},
-#     "GLYCERIN": {"enabled": True, "min": 0.6, "max": 1.2, "pause_ms": 3000},
-#     "BLUESIL": {"enabled": True, "min": 0.6, "max": 1.4, "pause_ms": 4000},
-#     "BLUESILV12": {"enabled": True, "min": 0.6, "max": 3.6, "pause_ms": 5000},
-#     # "BLUESILV12": {"enabled": True, "min": 0.6, "max": 1.2, "pause_ms": 5000},
-#     "BLUESILV30": {"enabled": True, "min": 0.6, "max": 1.2, "pause_ms": 5000},
-# }
-
-# VISCOSITY_OUT_STEP_SIZE_LIMITS = {
-#     "WATER": {"enabled": False, "min": 1.0, "max": 3.0, "pause_ms": 0},
-#     "GLYCERIN": {"enabled": False, "min": 1.0, "max": 3.0, "pause_ms": 0},
-#     "BLUESIL": {"enabled": True, "min": 0.6, "max": 42.0, "pause_ms": 4000},
-#     "BLUESILV12": {"enabled": True, "min": 0.6, "max": 30.0, "pause_ms": 5000},
-#     # "BLUESILV12": {"enabled": True, "min": 0.6, "max": 10.0, "pause_ms": 5000},
-#     "BLUESILV30": {"enabled": True, "min": 0.6, "max": 8, "pause_ms": 5000},
-# }
-
-#### These values below are for short tubing tests
-
-# VISCOSITY_IN_STEP_SIZE_LIMITS = {
-#     "WATER": {"enabled": False, "min": 0.1, "max": 3.0, "pause_ms": 0},
-#     "GLYCERIN": {"enabled": True, "min": 1.0, "max": 3.0, "pause_ms": 2000},
-#     "BLUESIL": {"enabled": True, "min": 0.6, "max": 2.4, "pause_ms": 4000},
-#     # "BLUESILV12": {"enabled": True, "min": 0.6, "max": 2.4, "pause_ms": 5000},
-#     "BLUESILV12": {"enabled": True, "min": 0.6, "max": 1.2, "pause_ms": 10000},
-#     "BLUESILV30": {"enabled": True, "min": 0.6, "max": 1.2, "pause_ms": 5000},
-#     "SILTECH60": {"enabled": True, "min": 0.4, "max": 1.2, "pause_ms": 6000},
-#     "BLUESILV60": {"enabled": True, "min": 0.4, "max": 1.0, "pause_ms": 14000},
-# }
-
-# VISCOSITY_OUT_STEP_SIZE_LIMITS = {
-#     "WATER": {"enabled": False, "min": 1.0, "max": 3.0, "pause_ms": 0},
-#     "GLYCERIN": {"enabled": False, "min": 1.0, "max": 3.0, "pause_ms": 0},
-#     "BLUESIL": {"enabled": True, "min": 0.6, "max": 42.0, "pause_ms": 4000},
-#     "BLUESILV12": {"enabled": True, "min": 0.6, "max": 20.0, "pause_ms": 5000},
-#     # "BLUESILV12": {"enabled": True, "min": 0.6, "max": 10.0, "pause_ms": 5000},
-#     "BLUESILV30": {"enabled": True, "min": 0.6, "max": 8, "pause_ms": 5000},
-#     "SILTECH60": {"enabled": True, "min": 0.6, "max": 8, "pause_ms": 5000},
-#     "BLUESILV60": {"enabled": True, "min": 0.6, "max": 8, "pause_ms": 7000},
-# }
-
-#### These values below are for pressurized tests with short tubing
 
 VISCOSITY_IN_STEP_SIZE_LIMITS = {
     "WATER": {"enabled": False, "min": 0.1, "max": 3.0, "pause_ms": 0},
@@ -183,7 +139,7 @@ WIFI_DISABLE_POWERSAVE = True
 # legitimately takes longer than that to yield back to the scheduler, this fires
 # and hard-resets the board mid-move. Left OFF by default until the WiFi link is
 # proven reliable under real bench conditions; flip to True once confirmed solid.
-ENABLE_WATCHDOG = False
+ENABLE_WATCHDOG = True
 WATCHDOG_TIMEOUT_MS = 8000
 
 
@@ -814,75 +770,6 @@ class Actuator:
         else:
             print(f"[ACTUATOR] Error: Invalid direction '{direction}' (use 'IN' or 'OUT')")
             return False
-
-
-# =====================================================
-# DISPENSER CLASS -> Old so not really used anymore, but keeping for reference
-# =====================================================
-
-class Dispenser: 
-    """Queue-based dispenser combining valve and actuator control.
-    
-    Args:
-        valve: Valve instance
-        actuator: Actuator instance
-    """
-    
-    def __init__(self, valve, actuator):
-        self.valve = valve
-        self.actuator = actuator
-        self.queue = []
-        self.busy = False
-        self.completed = 0
-
-    def enqueue(self, volume_ml):
-        """Add a dispense operation to the queue.
-
-        Args:
-            volume_ml: Volume in mL to dispense
-        """
-        vol = float(volume_ml)
-        self.queue.append(vol)
-        print(f"[DISPENSER] Queued {vol:.2f} mL (queue length: {len(self.queue)})")
-
-    async def process_queue(self):
-        """Process queued dispense operations continuously."""
-        while True:
-            if self.queue and not self.busy:
-                if not self.actuator.can_run_motor():
-                    cooldown = self.actuator.get_cooldown_time_s()
-                    duty = self.actuator.get_duty_cycle()
-                    print(f"[DISPENSER] ⚠ Duty cycle at {duty:.1f}% - waiting {cooldown:.0f}s")
-                    await asyncio.sleep_ms(int(cooldown * 1000))
-                    continue
-
-                self.busy = True
-                volume_ml = self.queue.pop(0)
-                await self._dispense(volume_ml)
-                self.completed += 1
-                self.busy = False
-
-            await asyncio.sleep_ms(500)
-
-    async def _dispense(self, volume_ml):
-        """Execute a single dispense operation.
-        
-        Args:
-            volume_ml: Volume in mL to dispense
-        """
-        print(f"\n=== DISPENSE {volume_ml:.2f} mL ===")
-
-        start_pos, start_adc = self.actuator.read_position()
-        print(f"[DISPENSER] IN:  {start_pos:.2f}% (ADC {start_adc})")
-        ok_in = await self.actuator.pump_vol(volume_ml, "IN")
-        await asyncio.sleep(1)
-
-        mid_pos, mid_adc = self.actuator.read_position()
-        print(f"[DISPENSER] OUT: {mid_pos:.2f}% (ADC {mid_adc})")
-        ok_out = await self.actuator.pump_vol(volume_ml, "OUT")
-        await asyncio.sleep(1)
-
-        print(f"=== DONE (in={ok_in}, out={ok_out}) ===\n")
 
 
 # =====================================================

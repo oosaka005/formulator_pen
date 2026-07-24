@@ -123,7 +123,7 @@ DEFAULT_HOME_POSITION = 15.0
 
 # Formulator Motion
 FORMULATOR_PWM_PERCENT = 30  # Actuator speed (0-100)
-FORMULATOR_FLUID_PROFILE = "BLUESILV12"  # Must match Pico profile names (e.g., WATER, GLYCERIN, BLUESIL)
+FORMULATOR_FLUID_PROFILE = "GLYCERIN"  # Must match Pico profile names (e.g., WATER, GLYCERIN, BLUESIL)
 
 # Formulator operation mode (now per-job via enqueue(operation_mode=...))
 # - NORMAL: Existing dispense behavior (volume-based PUMP IN/OUT)
@@ -238,7 +238,7 @@ def sync_all_fluid_profiles(formulator):
         if not ok:
             print(f"[INIT] WARNING: Failed to sync profile {token}")
 
-# Z-Only Motion (No XY moves for now)
+# ***Parameters for fill and dispense Z moves for Arch#3***
 # Update these Z positions for your setup.
 Z_LOAD = -20       # Z position for loading/drawing fluid
 Z_DISPENSE = 0  # Z position for dispense
@@ -818,7 +818,6 @@ class IntegratedDispenser:
                     await self._do_fill(job, command_volume_ml, profile_token, pwm_in, pwm_out)
 
                 if job.action in ("DISPENSE", "BOTH"):
-                    time.sleep(5)
                     await self._do_dispense(job, command_volume_ml, profile_token, pwm_out)
 
                 job.status = "COMPLETED"
@@ -1026,23 +1025,22 @@ async def main():
         
         # Example: Queue some dispense jobs (each job can specify its own mode)
         print("[MAIN] Queueing dispense jobs...")
-        
-        # # #Queue a PRIMING job (no volume needed)
-        # print("[MAIN] Queueing 1 PRIMING job")
-        # dispenser.enqueue(operation_mode="PRIMING")
+
+        # #Queue a PRIMING job (no volume needed)
+        print("[MAIN] Queueing 1 PRIMING job")
+        dispenser.enqueue(operation_mode="PRIMING")
 
         #Queue NORMAL jobs (default mode, volume required, action="BOTH")
         # print("[MAIN] Queueing NORMAL jobs")
-        # for i in range(3):
-        #     dispenser.enqueue(3)
+        # for i in range(1):
+        #     dispenser.enqueue(1, fluid_profile="GLYCERIN")
 
         # Test pattern: fill once for 5.2 mL, then dispense 0.2 mL at a time, 10 times,
         # each computed as a %-delta move from wherever the actuator currently sits.
-        print("[MAIN] Queueing FILL (5.2 mL) + 10x DISPENSE (0.2 mL) test pattern")
-        for u in range(3):
-            dispenser.enqueue(volume_ml=5.2, action="FILL")
-            for i in range(10):
-                dispenser.enqueue(volume_ml=0.2, action="DISPENSE")
+        # print("[MAIN] Queueing FILL (5.2 mL) + 10x DISPENSE (0.2 mL) test pattern")
+        # dispenser.enqueue(volume_ml=5.2, action="FILL")
+        # for i in range(3):
+        #     dispenser.enqueue(volume_ml=2, action="DISPENSE")
         
         # Keep running until queue is empty
         while dispenser.queue or dispenser.busy:

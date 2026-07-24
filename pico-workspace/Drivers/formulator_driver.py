@@ -58,9 +58,18 @@ class FormulatorDriver:
         print(f"[{self.formulator_id}] Disconnected")
 
     def _ensure_open(self):
-        """Check connection is open."""
+        """Check connection is open, reconnecting if it has dropped (e.g. the Pico reset).
+
+        Lets a dropped connection self-heal on the next command instead of failing
+        forever -- callers (IntegratedDispenser.process_queue) already retry on a
+        short interval and treat exceptions as "try again later", so a reconnect
+        attempt here that fails (Pico still rebooting) just surfaces the same way
+        a normal command failure would, and succeeds automatically once the Pico
+        is back up on WiFi.
+        """
         if not self.connection:
-            raise RuntimeError(f"[{self.formulator_id}] Not connected. Call open() first.")
+            print(f"[{self.formulator_id}] Connection not open -- reconnecting to {self.host}:{self.port}...")
+            self.open()
 
     def _readline(self, deadline):
         """Read one newline-terminated line from the socket, buffering partial reads.
