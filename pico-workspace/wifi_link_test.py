@@ -24,7 +24,7 @@ from pathlib import Path
 
 # Edit this to the Pico's IP once you know it (see "Before running" above).
 # Overridden by --host on the command line if you pass one.
-DEFAULT_HOST = "192.168.10.177"
+DEFAULT_HOST = "192.168.10.166"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:

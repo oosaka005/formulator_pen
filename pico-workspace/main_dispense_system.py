@@ -98,7 +98,7 @@ CNC_VIRTUAL = False  # Set to False for real hardware
 CNC_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 CNC_BAUD = 115200
 
-BALANCE_PORT = "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_DBBMb147613-if00-port0"
+BALANCE_PORT = "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_AODKb147613-if00-port0"
 BALANCE_BAUD = 9600
 BALANCE_TIMEOUT = 2.0
 
@@ -106,9 +106,12 @@ BALANCE_TIMEOUT = 2.0
 # instead of USB serial. Set FORMULATOR_HOST to the Pico's IP -- either a static
 # IP configured in the firmware's STATIC_IP constant, or a DHCP reservation on
 # your router/Pi5 AP keyed to the Pico's MAC address so it stays stable.
-FORMULATOR_HOST = "192.168.10.177"
+FORMULATOR_HOST = "192.168.10.166"
 FORMULATOR_TCP_PORT = 8888
-FORMULATOR_ID = "formulator1"
+FORMULATOR_ID = "formulatorblack"
+# FORMULATOR_HOST = "192.168.10.188"
+# FORMULATOR_TCP_PORT = 8888
+# FORMULATOR_ID = "formulatorwhite"
 
 # Formulator Calibration (reference profile used by firmware)
 # Formula: target_percent = (volume_ml + CALIBRATION_OFFSET) / CALIBRATION_SLOPE
@@ -123,7 +126,7 @@ DEFAULT_HOME_POSITION = 15.0
 
 # Formulator Motion
 FORMULATOR_PWM_PERCENT = 30  # Actuator speed (0-100)
-FORMULATOR_FLUID_PROFILE = "GLYCERIN"  # Must match Pico profile names (e.g., WATER, GLYCERIN, BLUESIL)
+FORMULATOR_FLUID_PROFILE = "SILTECH60"  # Must match Pico profile names (e.g., WATER, GLYCERIN, BLUESIL)
 
 # Formulator operation mode (now per-job via enqueue(operation_mode=...))
 # - NORMAL: Existing dispense behavior (volume-based PUMP IN/OUT)
@@ -142,13 +145,23 @@ PRIMING_OUT_TARGET_PERCENT = 2.0
 #   live hardcoded in the Pico firmware (VISCOSITY_IN/OUT_STEP_SIZE_LIMITS). It now
 #   lives here and gets pushed to the Pico at runtime via sync_all_fluid_profiles()
 #   below, so adding/tuning a fluid no longer requires reflashing firmware.
+# - multi_dispense_offset: separate from calibration_offset. Repeated fill -> partial
+#   dispense testing (see the "Dispense repeatability by volume" artifact) showed that
+#   excluding dispense #1, each fluid settles to a fixed ABSOLUTE gram offset from
+#   target that's roughly constant across volumes -- e.g. glycerin overshoots by
+#   ~+0.055g whether the target is 1g or 0.2g, not by a fixed %. calibration_offset
+#   can't correct for this (it's a full-round-trip-only term that a mid-stroke partial
+#   dispense never reaches -- see _apply_profile_delta_correction). This is applied
+#   only to action="DISPENSE" (delta) moves. Defaults to 0.0 (no correction) for any
+#   fluid without measured data yet -- don't guess a value without a real test batch.
 #
-# Keep the reference profile at offset=0, slope=1 (no correction).
+# Keep the reference profile at offset=0, slope=1, multi_dispense_offset=0 (no correction).
 FLUID_PROFILES = {
     "WATER": {
         "formulator_profile": "WATER",
         "calibration_offset": 0.0981,
         "calibration_slope": 0.9627,
+        "multi_dispense_offset": 0.0,  # no measured data yet
         "pwm_in_percent": 30,
         "pwm_out_percent": 30,
         "relief_enabled": False,
@@ -159,9 +172,10 @@ FLUID_PROFILES = {
         "formulator_profile": "GLYCERIN",
         "calibration_offset": -0.0206,
         "calibration_slope": 1.2165,
+        "multi_dispense_offset": 0.055,  # measured: excl.#1 settled +0.047g@1g, +0.053g@0.5g, +0.065g@0.2g
         "pwm_in_percent": 30,
         "pwm_out_percent": 30,
-        "relief_enabled": False,
+        "relief_enabled": True,
         "in_enabled": True, "in_min_step": 1.0, "in_max_step": 3.0, "in_pause_ms": 2000,
         "out_enabled": False, "out_min_step": 1.0, "out_max_step": 3.0, "out_pause_ms": 0,
     },
@@ -169,6 +183,7 @@ FLUID_PROFILES = {
         "formulator_profile": "BLUESIL",
         "calibration_offset": -0.2001,
         "calibration_slope": 0.9446,
+        "multi_dispense_offset": 0.0,  # no measured data yet
         "pwm_in_percent": 25,
         "pwm_out_percent": 30,
         "relief_enabled": True,
@@ -177,18 +192,20 @@ FLUID_PROFILES = {
     },
     "BLUESILV12": {
         "formulator_profile": "BLUESILV12",
-        "calibration_offset": 0.1569,
-        "calibration_slope": 0.9326,
+        "calibration_offset": -0.1238,
+        "calibration_slope": 0.9319,
+        "multi_dispense_offset": 0.020,  # measured: excl.#1 settled +0.023g@1g, +0.015g@0.5g, +0.022g@0.2g
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
-        "in_enabled": True, "in_min_step": 0.3, "in_max_step": 3.6, "in_pause_ms": 3000,
+        "in_enabled": True, "in_min_step": 0.3, "in_max_step": 1.2, "in_pause_ms": 4000,
         "out_enabled": True, "out_min_step": 0.3, "out_max_step": 10.0, "out_pause_ms": 5000,
     },
     "BLUESILV30": {
         "formulator_profile": "BLUESILV30",
         "calibration_offset": 0,
         "calibration_slope": 1,
+        "multi_dispense_offset": 0.0,  # no measured data yet
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
@@ -197,18 +214,20 @@ FLUID_PROFILES = {
     },
     "SILTECH60": {
         "formulator_profile": "SILTECH60",
-        "calibration_offset": -0.0292,
-        "calibration_slope": 0.9427,
+        "calibration_offset": -0.0957,
+        "calibration_slope": 0.9452,
+        "multi_dispense_offset": -0.02,  # measured: excl.#1 settled -0.008g@1g, -0.030g@0.5g, -0.025g@0.2g
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
-        "in_enabled": True, "in_min_step": 0.4, "in_max_step": 1.2, "in_pause_ms": 1500,
+        "in_enabled": True, "in_min_step": 0.4, "in_max_step": 1.2, "in_pause_ms": 10000,
         "out_enabled": True, "out_min_step": 0.6, "out_max_step": 8.0, "out_pause_ms": 5000,
     },
      "BLUESILV60": {
         "formulator_profile": "BLUESILV60",
         "calibration_offset": -0.0724,
         "calibration_slope": 0.9307,
+        "multi_dispense_offset": 0.0,  # no measured data yet
         "pwm_in_percent": 25,
         "pwm_out_percent": 25,
         "relief_enabled": True,
@@ -224,8 +243,15 @@ def sync_all_fluid_profiles(formulator):
     Call once after connecting -- the Pico then has all fluids' step-limit
     profiles cached in RAM, and per-job code only needs to select which one
     is active (via set_default_fluid / the profile token passed per command).
+
+    Returns:
+        bool: True only if every profile synced successfully. A job run with a
+        stale/missing step-limit profile on the Pico (leftover firmware defaults,
+        or a profile from whatever fluid ran last) can silently mis-dispense, so
+        callers should treat a False return as fatal rather than a warning.
     """
     print("[INIT] Syncing fluid step-limit profiles to formulator...")
+    all_ok = True
     for key, profile in FLUID_PROFILES.items():
         token = str(profile.get("formulator_profile", key)).strip().upper()
         ok = formulator.sync_fluid_profile(
@@ -237,6 +263,36 @@ def sync_all_fluid_profiles(formulator):
         )
         if not ok:
             print(f"[INIT] WARNING: Failed to sync profile {token}")
+            all_ok = False
+    return all_ok
+
+
+async def reconnect_formulator_after_reset(formulator, initial_wait_s=5.0, max_attempts=10, retry_interval_s=2.0):
+    """Wait for the Pico to reboot and reassociate with WiFi, then reopen the connection.
+
+    formulator.reset() closes the connection immediately and reboots the board --
+    the Pico needs real time to come back up on WiFi before a fresh open() can
+    succeed, so this retries on an interval (same pattern as wifi_link_test.py's
+    reset test) rather than trying exactly once right after reset().
+
+    Returns:
+        bool: True once open() succeeds and the formulator responds to READY?,
+        False if it never comes back within the attempt budget.
+    """
+    print(f"[INIT] Waiting {initial_wait_s:.0f}s for formulator to reboot...")
+    await asyncio.sleep(initial_wait_s)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            formulator.open()
+            if formulator.is_ready():
+                print(f"[INIT] Formulator back online (attempt {attempt}/{max_attempts})")
+                return True
+        except (OSError, RuntimeError) as e:
+            print(f"[INIT] Reconnect attempt {attempt}/{max_attempts} failed: {e}")
+        await asyncio.sleep(retry_interval_s)
+
+    return False
 
 # ***Parameters for fill and dispense Z moves for Arch#3***
 # Update these Z positions for your setup.
@@ -278,6 +334,7 @@ class DispenseJob:
         self.target_percent = None
         self.profile_calibration_offset = None
         self.profile_calibration_slope = None
+        self.profile_multi_dispense_offset = None
         self.profile_pwm_in_percent = None
         self.profile_pwm_out_percent = None
         self.relief_enabled = False
@@ -349,11 +406,12 @@ class IntegratedDispenser:
         token = str(profile.get("formulator_profile", key)).strip().upper()
         offset = float(profile.get("calibration_offset", 0.0))
         slope = float(profile.get("calibration_slope", 1.0))
+        multi_dispense_offset = float(profile.get("multi_dispense_offset", 0.0))
         pwm_in = max(0, min(100, int(profile.get("pwm_in_percent", FORMULATOR_PWM_PERCENT))))
         pwm_out = max(0, min(100, int(profile.get("pwm_out_percent", FORMULATOR_PWM_PERCENT))))
         relief_enabled = bool(profile.get("relief_enabled", False))
 
-        return key, token, offset, slope, pwm_in, pwm_out, relief_enabled
+        return key, token, offset, slope, multi_dispense_offset, pwm_in, pwm_out, relief_enabled
 
     def _apply_profile_volume_correction(self, requested_volume_ml, profile_offset, profile_slope):
         """Apply inverse fluid TF to requested volume to get command volume.
@@ -381,18 +439,23 @@ class IntegratedDispenser:
         """
         return command_volume_ml / CALIBRATION_SLOPE
 
-    def _apply_profile_delta_correction(self, requested_volume_ml, profile_slope):
-        """Fluid correction for a partial (delta) dispense — deliberately no profile_offset term.
+    def _apply_profile_delta_correction(self, requested_volume_ml, profile_slope, multi_dispense_offset=0.0):
+        """Fluid correction for a partial (delta) dispense.
 
-        _apply_profile_volume_correction's profile_offset represents a one-time bonus
-        that only shows up on a full round trip back to home (e.g. relief/valve-seating
-        on arrival). A delta dispense stops mid-stroke and never reaches that event, so
-        subtracting profile_offset here would silently short every partial dispense by
-        about that amount.
+        Deliberately does NOT use profile_offset (_apply_profile_volume_correction's
+        offset term) -- that represents a one-time bonus that only shows up on a full
+        round trip back to home (e.g. relief/valve-seating on arrival), which a delta
+        dispense stops mid-stroke and never reaches.
+
+        Instead applies multi_dispense_offset: a separate, empirically-measured constant
+        (from repeated fill -> partial-dispense testing) representing the fixed absolute
+        gram offset this fluid settles to once "warmed up" (excluding dispense #1),
+        which held roughly constant across tested volumes rather than scaling with them
+        -- see FLUID_PROFILES' multi_dispense_offset comment for the measured values.
         """
         if abs(profile_slope) < 1e-9:
             raise ValueError("Profile calibration_slope cannot be 0")
-        return max(0.0, requested_volume_ml / profile_slope)
+        return max(0.0, (requested_volume_ml - multi_dispense_offset) / profile_slope)
 
     def enqueue(self, volume_ml=None, container_id=None, location=None, fluid_profile=None, operation_mode=None, action=None, cycles=None):
         """Add a dispense job to the queue.
@@ -561,11 +624,14 @@ class IntegratedDispenser:
         %-delta move from that live position rather than a volume command, since only the
         firmware's PUMP command knows an absolute home-relative volume — a partial dispense
         from mid-stroke has to move by percent. The volume feeding that %-delta is corrected
-        via _apply_profile_delta_correction (slope only, no profile_offset) rather than the
-        job's upfront command_volume_ml, since profile_offset is a full-round-trip-only bonus
-        that a partial dispense never reaches. If the requested delta would move past the
-        DEFAULT_HOME_POSITION reference (i.e. not enough fluid remains from the last fill),
-        the move is skipped entirely — the actuator stays exactly where it is — and the job
+        via _apply_profile_delta_correction using profile_slope and multi_dispense_offset
+        (NOT profile_offset, and NOT job's upfront command_volume_ml) -- profile_offset is a
+        full-round-trip-only bonus that a partial dispense never reaches, while
+        multi_dispense_offset is a separate empirically-measured constant correcting for the
+        fixed settled-state gram offset partial dispenses actually show (see FLUID_PROFILES).
+        If the requested delta would move past the DEFAULT_HOME_POSITION reference (i.e. not
+        enough fluid remains from the last fill), the move is skipped entirely — the actuator
+        stays exactly where it is — and the job
         is flagged INSUFFICIENT_VOLUME instead of dispensing a different amount than asked for.
         """
         if job.action == "DISPENSE":
@@ -595,7 +661,9 @@ class IntegratedDispenser:
             current_pos = job.form_percent_pre_dispense
             if current_pos is None:
                 raise RuntimeError("Could not read actuator position for delta dispense")
-            delta_command_volume_ml = self._apply_profile_delta_correction(job.volume_ml, job.profile_calibration_slope)
+            delta_command_volume_ml = self._apply_profile_delta_correction(
+                job.volume_ml, job.profile_calibration_slope, job.profile_multi_dispense_offset
+            )
             delta_percent = self._to_firmware_delta_percent(delta_command_volume_ml)
             target_percent = current_pos - delta_percent
             job.target_percent = target_percent
@@ -759,7 +827,7 @@ class IntegratedDispenser:
         else:
             print(f"[DISPENSE] Target: PRIMING cycle{location_note}")
 
-        profile_key, profile_token, profile_offset, profile_slope, pwm_in, pwm_out, relief_enabled = self._resolve_fluid_profile(job.fluid_profile)
+        profile_key, profile_token, profile_offset, profile_slope, multi_dispense_offset, pwm_in, pwm_out, relief_enabled = self._resolve_fluid_profile(job.fluid_profile)
         
         # Volume correction only needed for NORMAL mode
         if job.operation_mode == "NORMAL":
@@ -781,6 +849,7 @@ class IntegratedDispenser:
         job.target_percent = target_percent
         job.profile_calibration_offset = profile_offset
         job.profile_calibration_slope = profile_slope
+        job.profile_multi_dispense_offset = multi_dispense_offset
         job.profile_pwm_in_percent = pwm_in
         job.profile_pwm_out_percent = pwm_out
         job.relief_enabled = relief_enabled
@@ -888,6 +957,7 @@ class IntegratedDispenser:
             "formulator_profile_token": job.formulator_profile_token,
             "calculated_step_size_percent": job.calculated_step_size_percent,
             "settle_time_used_ms": job.settle_time_used_ms,
+            "multi_dispense_offset_used": job.profile_multi_dispense_offset,
         }
         new_df = pd.DataFrame([row])
         if self.results_path.exists():
@@ -1009,8 +1079,22 @@ async def main():
     )
     formulator.open()
     await asyncio.sleep(1)
-    sync_all_fluid_profiles(formulator)
-    
+
+    if not sync_all_fluid_profiles(formulator):
+        print("[INIT] Fluid profile sync failed -- resetting formulator and retrying once...")
+        formulator.reset()
+        if not await reconnect_formulator_after_reset(formulator):
+            print("[INIT] FATAL: Formulator did not come back online after reset. Shutting down.")
+            balance.close()
+            formulator.close()
+            sys.exit(1)
+        if not sync_all_fluid_profiles(formulator):
+            print("[INIT] FATAL: Fluid profile sync failed again after reset. Not safe to continue "
+                  "(a fluid could be running with a stale/wrong step-limit profile). Shutting down.")
+            balance.close()
+            formulator.close()
+            sys.exit(1)
+
     # -------- Create dispenser and start processing --------
     dispenser = IntegratedDispenser(
         # cnc,
@@ -1026,21 +1110,22 @@ async def main():
         # Example: Queue some dispense jobs (each job can specify its own mode)
         print("[MAIN] Queueing dispense jobs...")
 
-        # #Queue a PRIMING job (no volume needed)
-        print("[MAIN] Queueing 1 PRIMING job")
-        dispenser.enqueue(operation_mode="PRIMING")
+        # # #Queue a PRIMING job (no volume needed)
+        # print("[MAIN] Queueing 1 PRIMING job")
+        # dispenser.enqueue(operation_mode="PRIMING", cycles=2)
 
         #Queue NORMAL jobs (default mode, volume required, action="BOTH")
         # print("[MAIN] Queueing NORMAL jobs")
         # for i in range(1):
-        #     dispenser.enqueue(1, fluid_profile="GLYCERIN")
+        #     dispenser.enqueue(1.5)
 
         # Test pattern: fill once for 5.2 mL, then dispense 0.2 mL at a time, 10 times,
         # each computed as a %-delta move from wherever the actuator currently sits.
-        # print("[MAIN] Queueing FILL (5.2 mL) + 10x DISPENSE (0.2 mL) test pattern")
-        # dispenser.enqueue(volume_ml=5.2, action="FILL")
-        # for i in range(3):
-        #     dispenser.enqueue(volume_ml=2, action="DISPENSE")
+        print("[MAIN] Queueing FILL (5.2 mL) + 10x DISPENSE (0.2 mL) test pattern")
+        # for u in range(1):
+        #     dispenser.enqueue(volume_ml=5.2, action="FILL")
+        for i in range(1):
+            dispenser.enqueue(volume_ml=0.3, action="DISPENSE")
         
         # Keep running until queue is empty
         while dispenser.queue or dispenser.busy:
