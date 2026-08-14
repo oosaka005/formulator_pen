@@ -1,5 +1,7 @@
 # Dispenser Project
 
+![System: Formulator Pen, with integrated syringe moved by a linear actuator, and regulated by a 3 way stopcock valve, to dispense varying fluids.](screenshot_2026-08-11_122401_480.png)
+
 An automated liquid formulation dispensing system built around a **Raspberry Pi 5** host controller, one or more **Raspberry Pi Pico W** microcontrollers driving the actual dispensing hardware, a CNC gantry for positioning, and a precision balance for verifying dispensed weight.
 
 The Pi 5 runs the whole show: it queues dispense jobs, talks to each Pico over WiFi to move a servo valve and a linear actuator (syringe pump), reads back the dispensed weight from the balance, and logs everything to Excel. This README covers everything a new user needs: what each file does, how to install and run the system, and — the part that actually requires domain judgment — how to calibrate a new fluid and tune its motion profile so it dispenses accurately without cavitating.
