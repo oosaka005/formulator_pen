@@ -11,7 +11,7 @@
 
 従来版は次に変更せず保全します。
 
-`C:\sdl_dev\formulator-pen-project\legacy\formulator_pen-main-20260727`
+`C:\sdl_dev\formulator_pen\legacy\formulator_pen-main-20260727`
 
 従来版の装置固有設定や校正値を最新版へ単純上書きせず、元コミットを特定してから
 移行ブランチ上で機能単位に取り込みます。
