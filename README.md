@@ -1,3 +1,12 @@
+> [!NOTE]
+> Except for this notice and [`MIGRATION.md`](MIGRATION.md), the current code in this
+> repository is an unchanged copy of
+> [`Renato-D/formulator_pen`](https://github.com/Renato-D/formulator_pen) at commit
+> [`0b22b44`](https://github.com/Renato-D/formulator_pen/commit/0b22b446979a33380dfe9e5b5088c17ecdd710a4),
+> shared by Renato. This repository is intended for sharing and reference, and we plan
+> to develop original code based on this codebase in the future. `MIGRATION.md` contains
+> information organized to support migrating Renato's code for use with the existing system.
+
 # Dispenser Project
 
 ![System: Formulator Pen, with integrated syringe moved by a linear actuator, and regulated by a 3 way stopcock valve, to dispense varying fluids.](screenshot_2026-08-11_122401_480.png)
